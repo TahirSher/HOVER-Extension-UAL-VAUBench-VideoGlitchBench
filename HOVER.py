@@ -129,6 +129,35 @@ Outputs go to <parent of --ual_root>/HOVER_v10_ual_work/ual_bench/ (or
 --ual_work_root), never into the VideoGlitchBench root, HOVER_v8_work, the GliDe
 repository or the UAL-Bench data. See the UAL-Bench section near the end.
 
+VAU-Bench extension (dataset-isolated; every command above is unchanged)
+------------------------------------------------------------------------
+VAU-Bench (Zhu et al., arXiv:2505.23504; https://github.com/GVCLab/VAU-R1; data
+https://huggingface.co/datasets/7xiang/VAU-Bench): MSAD / UCF-Crime / ECVA test
+sets, four tasks per video (multiple-choice QA, temporal anomaly grounding,
+anomaly classification, anomaly reasoning), scored by exact ports of the
+official evaluators (QA accuracy; TAG mIoU and R@0.3/0.5/0.7; CLS binary and
+20-way accuracy; VAU-Eval with deepseek-chat). HOVER-VAU: calibrated anomaly
+profile -> class hypothesis by Bayesian model averaging over the evidence
+window -> class-conditioned profile -> K = 1 segmentation + frame refinement ->
+QA by the same averaging -> official reasoning prompts on a storyboard of the
+localised segment. One predeclared rule; nothing is fitted on VAU-Bench.
+Backbones: Qwen2.5-VL-3B/7B-Instruct, InternVL2.5-8B, UI-TARS-1.5-7B.
+
+  python HOVER_v10.py selftest_vau [--vau_repo /path/VAU-R1]
+  python HOVER_v10.py inspect_vau  --vau_annotations_dir /path/VAU-R1/annotations --vau_dataset all
+  python HOVER_v10.py run_vau      --vau_annotations_dir /path/VAU-R1/annotations \
+      --vau_video_root /path/videos --vau_dataset msad --backbone qwen2.5-vl-7b --limit 2  # smoke
+  python HOVER_v10.py run_vau      --vau_source hf --vau_work_root /path/work --vau_dataset all \
+      --vau_video_root /path/videos --backbone all --vau_repo /path/VAU-R1 --vau_judge \
+      --vau_api_bases qwen2.5-vl-3b=http://localhost:8004/v1,qwen2.5-vl-7b=http://localhost:8000/v1,\
+internvl2.5-8b=http://localhost:8002/v1,ui-tars-1.5-7b=http://localhost:8003/v1
+  python HOVER_v10.py evaluate_vau --vau_annotations_dir ... --vau_dataset all --backbone all [--vau_judge]
+  python HOVER_v10.py evaluate_vau --vau_annotations_dir ... --vau_dataset ucf \
+      --vau_pred_csv qa=output_ucf_no_think.csv,tag=...,cls=...     # score official-format CSVs
+
+Outputs go to <parent of --vau_annotations_dir>/HOVER_v10_vau_work/vau_bench/ (or
+--vau_work_root). See the VAU-Bench section near the end and VAU_BENCH_NOTES.md.
+
 Portions (evaluation prompt, summariser prompt, preprocessing geometry,
 evaluator logic) follow the GliDe repository, MIT licence, (c) its authors.
 """
@@ -4885,7 +4914,8 @@ def _legacy_dataset_guard(a: argparse.Namespace) -> None:
     """VideoGlitchBench commands stay VideoGlitchBench-only."""
     require((a.dataset or "videoglitchbench") == "videoglitchbench",
             f"'{a.command}' is a VideoGlitchBench command; for UAL-Bench use inspect_ual, run_ual "
-            f"or evaluate_ual (got --dataset {a.dataset})")
+            f"or evaluate_ual, for VAU-Bench inspect_vau, run_vau or evaluate_vau (got --dataset "
+            f"{a.dataset})")
 
 
 def main_ual(a: argparse.Namespace) -> None:
@@ -5404,11 +5434,2627 @@ def selftest_ual(official_repo: str = "", verbose: bool = True) -> None:
 
 
 # =============================================================================
+# VAU-Bench: HOVER for video anomaly understanding (dataset-isolated extension)
+#
+# Everything in this block is new. No function above it was modified, and no
+# VideoGlitchBench or UAL-Bench path, cache, calibration or run is touched
+# (enforced by vau_resolve_work_root and tested in selftest_vau).
+#
+# Benchmark: VAU-Bench (Zhu, Chen, Shen & Cun, "VAU-R1: Advancing Video Anomaly
+# Understanding via Reinforcement Fine-Tuning", arXiv:2505.23504). Annotations
+# https://github.com/GVCLab/VAU-R1/tree/main/annotations and
+# https://huggingface.co/datasets/7xiang/VAU-Bench; videos are the original
+# MSAD, UCF-Crime and ECVA files. Test sets: test_msad.csv (240 videos),
+# test_ucf_crime.csv (290), test_ecva.csv (438); one row per video, 13 columns:
+#   Video Name, Question, Option 1..4, Correct Option, Key Object, Description,
+#   Reasoning, Anomaly Class, Start Time, End Time
+#
+# Four tasks, scored by the official scripts in src/evaluation/ (ported exactly):
+#   QA      evaluate_qa.py      Acc = #(str(pred).lower() == str(Correct Option).lower())
+#                               / #(non-NaN predictions) x 100
+#   TAG     evaluation_tag.py   over predicted videos whose GT is not (0, 0):
+#                               IoU = inter / (max(ends) - min(starts)), 0 if
+#                               pred_start == pred_end; mIoU and R@{0.3,0.5,0.7}
+#                               reported as round(x, 4) * 100
+#   CLS     evaluation_cls.py   prediction = FIRST of the 20 fixed options found in
+#                               the answer (inside <answer> if present); binary
+#                               acc (Normal vs any anomaly) and 20-way acc over
+#                               ALL GT rows (missing prediction = wrong)
+#   VAU-Eval evaluate_reasoning_deepseek.py: deepseek-chat rates (Description,
+#                               Analysis) against GT (Description, Reasoning):
+#                               5 x 0-10 + total 0-50, mean over judged videos
+#
+# Audit of the official test annotations (inspect_vau reproduces these counts):
+#   * UCF-Crime: 39 rows have Question / Options / Correct Option / Anomaly Class
+#     = '-1' (QA and CLS unanswerable, but scored); 16 rows have Start/End =
+#     (-1, -1). ECVA: 36 rows (-1, -1). evaluation_tag.py skips only (0, 0), so
+#     every (-1, -1) row is scored with IoU = 0 whatever the prediction. Published
+#     TAG numbers for UCF-Crime are multiples of 1/124 (= 140 - 16), i.e. they
+#     exclude those rows. Both are reported: 'official script' and 'valid GT'.
+#   * MSAD: 8 'Correct Option' values carry the option text ('D. Green trash
+#     bin ...'); the official string comparison can never match them.
+#   * QA divides by the number of non-NaN predictions and TAG by the number of
+#     predicted videos: abstaining would RAISE QA accuracy and remove hard TAG
+#     items. HOVER therefore answers every item; a missing video is scored as a
+#     wrong answer ('X'), a zero-length span and a CLS answer with no option.
+#   * Answer key skew: 'A' is correct for 68% (MSAD), 51% (UCF) and 52% (ECVA)
+#     of the questions. 'Always A' is reported as a reference row.
+#
+# HOVER-VAU (one predeclared rule, nothing fitted on VAU-Bench):
+#   E  generic anomaly profile  s_E(w) = logit P(Yes | w, q_E) - logit P(Yes | grey, q_E)
+#   H  class hypothesis by Bayesian model averaging over the evidence location z
+#      (exactly one window w carries the anomaly evidence, uniform prior on z):
+#         P(z = w | V) = softmax_w s(w),   P(c | V) = sum_w P(z = w | V) P(c | w)
+#      With conditionally independent windows, P(z = w | V) is proportional to the
+#      likelihood ratio LR_w; if the VLM's log-odds are prior log-odds + log LR_w,
+#      the contextually calibrated s(w) is exactly log LR_w. The sum runs over
+#      Occam's window (Madigan & Raftery, JASA 1994): the fewest windows holding
+#      >= 99% of the posterior mass, at most 8; the achieved mass is reported.
+#   V  hypothesis profile s_c(w) with the class-specific question, c = argmax
+#      P(c | V); the generic profile if c = Normal ('generic' is an ablation)
+#   S  K = 1 segmentation (tau = 0, lambda = inf: Kadane), boundary windows refined
+#      to frames by masked-frame bisection (HOVER G, unchanged)
+#   QA the same BMA with P(z | V) from the profile used by S
+#   R  the official description and analysis prompts (two turns, verbatim) on
+#      a storyboard of 8 frames of the localised segment +- 50% context; the
+#      system message states HOVER's evidence and that it may be wrong
+#   Option posteriors are NOT contextually calibrated by default: within one
+#   question the model posterior is already the Bayes-coherent quantity, and
+#   calibration would also remove legitimate text priors (ablation flag).
+#   Letter options are matched case-sensitively ('a' and 'I' are words, not
+#   options); Yes/No matching is the case-insensitive HOVER rule.
+#   Sampling: 2 fps (the qwen_vl_utils default used by the official TAG
+#   inference), 8-frame windows (4 s), frame refinement to 0.5 s.
+# =============================================================================
+
+VAU_ADAPTER_VERSION = "vau-hover-1.0"
+VAU_PROMPT_VERSION = "vau-prompts-1"
+VAU_SUBSETS: Tuple[str, ...] = ("msad", "ucf", "ecva")
+VAU_DISPLAY = {"msad": "MSAD", "ucf": "UCF-Crime", "ecva": "ECVA"}
+VAU_TEST_FILES = {"msad": "test_msad.csv", "ucf": "test_ucf_crime.csv", "ecva": "test_ecva.csv"}
+VAU_HF_REPO = "7xiang/VAU-Bench"
+VAU_COLUMNS = ("Video Name", "Question", "Option 1", "Option 2", "Option 3", "Option 4",
+               "Correct Option", "Key Object", "Description", "Reasoning", "Anomaly Class",
+               "Start Time", "End Time")
+# evaluation_cls.py FIXED_OPTION, in the official order (also the option list of
+# inference_cls_qwen.py).
+VAU_CLASSES: Tuple[str, ...] = (
+    "Abuse", "Agriculture", "Arrest", "Arson", "Assault", "Explosion",
+    "Fighting", "Fire", "Food Safety", "Medical Abnormality", "Natural Hazard",
+    "Normal", "Object_falling", "People_falling", "Robbery", "Shooting",
+    "Stealing", "Traffic_accident", "Vandalism", "Water_incident")
+VAU_LETTERS = "ABCDEFGHIJKLMNOPQRST"
+VAU_QA_LETTERS = "ABCD"
+VAU_TASKS: Tuple[str, ...] = ("qa", "tag", "cls", "reason")
+VAU_BACKBONES: Dict[str, Tuple[str, str]] = {
+    "qwen2.5-vl-3b": ("Qwen2.5-VL-3B-Instruct", "Qwen/Qwen2.5-VL-3B-Instruct"), **UAL_BACKBONES}
+VAU_RECALLS = (0.3, 0.5, 0.7)
+VAU_EVAL_KEYS = ("classification_score", "key_matching_score", "fluency_score",
+                 "informativeness_score", "factual_score", "total_score")
+VAU_EVAL_SHORT = {"classification_score": "CLS", "key_matching_score": "KM",
+                  "fluency_score": "FLU", "informativeness_score": "INF",
+                  "factual_score": "FAC", "total_score": "Total"}
+VAU_PRED_HEADERS = {"qa": ("Video Name", "QA answer"),
+                    "tag": ("Video Name", "Temporal Grounding"),
+                    "cls": ("Video Name", "CLS answer"),
+                    "reason": ("Video Name", "Description", "Analysis")}
+VAU_OFFICIAL_SCRIPTS = {"qa": "evaluate_qa.py", "tag": "evaluation_tag.py",
+                        "cls": "evaluation_cls.py"}
+VAU_COMMANDS = ("inspect_vau", "run_vau", "evaluate_vau", "selftest_vau")
+VAU_TAG_PROFILES = ("hypothesis", "generic")
+VAU_REASON_CONTEXTS = ("hover", "none")
+VAU_PREDECLARED: Dict[str, Any] = {
+    "fps": 2.0, "seg_tau": 0.0, "seg_penalty": 1e9, "refine_mode": "frame",
+    "tag_profile": "hypothesis", "bma_mass": 0.99, "bma_max_windows": 8,
+    "option_calibration": False, "reason_context": "hover", "storyboard_frames": 8,
+    "storyboard_context": 0.5}
+VAU_REASON_MAX_TOKENS = 1024          # max_new_tokens of the official inference scripts
+VAU_MISSING_QA = "X"                  # never NaN: NaN would leave the QA denominator
+
+# ---- prompts ------------------------------------------------------------------
+_VAU_LAYOUT = ("The image is one stitched window of consecutive video frames, each labelled "
+               "'#<frame index>' in temporal order (left to right, top row then bottom row).")
+P_VAU_ANOMALY_SYS = (
+    "You are a video anomaly analyst. " + _VAU_LAYOUT + " An anomaly is an unusual, abnormal "
+    "or suspicious event, for example a crime, violence, an accident, a fall, a fire, an "
+    "explosion or a hazard. Decide whether such an event is visibly occurring in this window. "
+    "Being plausible is not enough; it must be observable.")
+P_VAU_CLS_SYS = "You are an advanced video anomaly classifier. " + _VAU_LAYOUT
+P_VAU_QA_SYS = "You are a helpful assistant. " + _VAU_LAYOUT
+# inference_cls_qwen.py FIXED_QUESTION, verbatim.
+VAU_CLS_QUESTION = ("What type of anomaly appears in the video? If no anomaly appears, please "
+                    "answer 'Normal'.")
+# inference_qa_qwen.py generate_prompt_w_o_think, verbatim (whitespace included).
+_VAU_QA_TEMPLATE = (
+    "\n            You are a helpful AI assistant performing video anomaly detection reasoning. "
+    "\n            Below is a video description and a reasoning process. Based on this, answer "
+    "the following multiple-choice question correctly.\n\n            ### Question:\n"
+    "            {q}\n\n            ### Options:\n            \"A. \"{o1}\n            \"B. \"{o2}\n"
+    "            \"C. \"{o3}\n            \"D. \"{o4}\n\n            Please only output one option "
+    "letter (A, B, C, or D). Please do not output other words.\n            ")
+# inference_reasoning_qwen.py, verbatim; asked as two turns of one conversation.
+VAU_DESCRIPTION_PROMPT = (
+    "You are an advanced anomaly detector assigned to analyze a video. Please identify any "
+    "unusual or suspicious events that occur in the scene. Do not focus on any text or "
+    "watermarks that might appear. Provide a description in five sentences.")
+VAU_ANALYSIS_PROMPT = ("Explain in detail whether (and how) any anomaly occurs in the video, and "
+                       "the reasoning behind it.")
+# evaluate_reasoning_deepseek.py, verbatim (system message and f-string body).
+VAU_JUDGE_SYSTEM = "You are an expert evaluator for video anomaly detection outputs."
+_VAU_JUDGE_TEMPLATE = (
+    "\n        Below is a ground-truth description and analysis, followed by a model-generated "
+    "description and analysis. Please evaluate the model's outputs from the following aspects:\n\n"
+    "        1. Classification Correctness (10 pts)  \n"
+    "        2. Key Object and Action Matching (10 pts)  \n"
+    "        3. Fluency and Coherence (10 pts)  \n"
+    "        4. Informativeness and Domain Awareness (10 pts)  \n"
+    "        5. Factual Consistency (10 pts)\n\n        ---\n        Ground Truth:\n"
+    "        - Description: {gt_description}\n        - Analysis: {gt_analysis}\n\n"
+    "        Model Output:\n        - Description: {description}\n        - Analysis: {analysis}\n\n"
+    "        Please return a JSON object strictly formatted as:\n\n        {{\n"
+    "            \"classification_score\": int (0-10),\n"
+    "            \"key_matching_score\": int (0-10),\n"
+    "            \"fluency_score\": int (0-10),\n"
+    "            \"informativeness_score\": int (0-10),\n"
+    "            \"factual_score\": int (0-10),\n"
+    "            \"total_score\": int (0-50),\n"
+    "            \"comments\": {{\n"
+    "                \"classification\": \"...\",\n"
+    "                \"key_matching\": \"...\",\n"
+    "                \"fluency\": \"...\",\n"
+    "                \"informativeness\": \"...\",\n"
+    "                \"factual\": \"...\"\n"
+    "            }}\n        }}\n        ")
+
+
+def vau_human(c: str) -> str:
+    """'Traffic_accident' -> 'traffic accident' (the presence-question wording)."""
+    return re.sub(r"[_\s]+", " ", c).strip().lower()
+
+
+def vau_anomaly_user() -> str:
+    return "Is there any anomaly in this window? Answer with exactly one word: Yes or No."
+
+
+def vau_class_user(c: str) -> str:
+    return (f"Anomaly type: {vau_human(c)}.\nIs an anomaly of this type visibly occurring in this "
+            f"window? Answer with exactly one word: Yes or No.")
+
+
+def vau_cls_user() -> str:
+    opts = "\n".join(f"{L}. {c}" for L, c in zip(VAU_LETTERS, VAU_CLASSES))
+    return (f"Question: {VAU_CLS_QUESTION}\nOptions:\n{opts}\nAnswer with exactly one option "
+            f"letter ({VAU_LETTERS[0]}-{VAU_LETTERS[-1]}).")
+
+
+def vau_qa_user(q: "VAUItem") -> str:
+    return _VAU_QA_TEMPLATE.format(q=q.question, o1=q.options[0], o2=q.options[1],
+                                   o3=q.options[2], o4=q.options[3])
+
+
+def vau_judge_prompt(gt_description: str, gt_analysis: str, description: str,
+                     analysis: str) -> str:
+    return _VAU_JUDGE_TEMPLATE.format(gt_description=gt_description, gt_analysis=gt_analysis,
+                                      description=description, analysis=analysis)
+
+
+def vau_reason_system(t0: float, t1: float, duration: float,
+                      hyp: Optional[Tuple[str, float, float, float]]) -> str:
+    """hyp = (class, posterior, start, end) of HOVER, or None (official-prompt baseline)."""
+    s = ("You are a helpful assistant. The image is a storyboard of frames sampled in temporal "
+         "order from one video (left to right, top row then bottom row), each labelled "
+         f"'#<frame index>'. The frames cover {t0:.1f}-{t1:.1f} s of a {duration:.1f} s video.")
+    if hyp is None:
+        return s
+    c, p, a, b = hyp
+    lab = ("its most likely label is 'normal' (no anomaly)" if c == "Normal"
+           else f"its most likely anomaly type is '{vau_human(c)}'")
+    return (s + f" An automatic detector localised the most anomalous segment at {a:.1f}-{b:.1f} s; "
+            f"{lab} (posterior probability {p:.2f}). This evidence may be wrong: describe only "
+            f"what is visible.")
+
+
+# -----------------------------------------------------------------------------
+# Records: the model-visible part and the evaluator-only part are separate types
+# -----------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class VAUItem:
+    """Model-visible part of one test video: no class, interval, answer or text GT."""
+    subset: str
+    video_name: str        # official key ('Video Name'), also the file name
+    question: str
+    options: Tuple[str, str, str, str]
+
+
+@dataclass(frozen=True)
+class VAUGroundTruth:
+    video_name: str
+    correct_option: str    # verbatim (may be '-1' or carry the option text)
+    anomaly_class: str     # verbatim (may be '-1')
+    start_time: float
+    end_time: float
+    description: str
+    reasoning: str
+    key_object: str
+
+    @property
+    def tag_normal(self) -> bool:            # evaluation_tag.py get_gt_label
+        return self.start_time == 0.0 and self.end_time == 0.0
+
+    @property
+    def tag_valid(self) -> bool:             # a usable GT interval
+        return 0.0 <= self.start_time < self.end_time
+
+
+@dataclass
+class VAUDataset:
+    subset: str
+    annotation_path: str
+    annotation_sha256: str     # depends on GT: metadata only, never in a cache key
+    inputs_fingerprint: str    # GT-free: (video, question, options) of every row
+    items: List[VAUItem]
+    gt: Dict[str, VAUGroundTruth]
+    raw_rows: Dict[str, Dict[str, str]]     # verbatim CSV rows (evaluator only)
+    video_paths: Dict[str, Optional[str]]
+    video_dirs: List[str]
+    source: str
+
+
+@dataclass
+class VAUSettings:
+    subsets: Tuple[str, ...] = ()
+    source: str = "local"                   # 'local' CSV directory | 'hf' (7xiang/VAU-Bench)
+    annotations_dir: str = ""
+    subset_annotations: Dict[str, str] = field(default_factory=dict)
+    hf_repo: str = VAU_HF_REPO
+    hf_revision: str = ""
+    video_root: str = ""
+    subset_videos: Dict[str, str] = field(default_factory=dict)
+    work_root: str = ""
+    tasks: Tuple[str, ...] = VAU_TASKS
+    fps: float = VAU_PREDECLARED["fps"]
+    seg_tau: float = VAU_PREDECLARED["seg_tau"]
+    seg_penalty: float = VAU_PREDECLARED["seg_penalty"]
+    refine_mode: str = VAU_PREDECLARED["refine_mode"]
+    tag_profile: str = VAU_PREDECLARED["tag_profile"]
+    bma_mass: float = VAU_PREDECLARED["bma_mass"]
+    bma_max_windows: int = VAU_PREDECLARED["bma_max_windows"]
+    option_calibration: bool = VAU_PREDECLARED["option_calibration"]
+    reason_context: str = VAU_PREDECLARED["reason_context"]
+    storyboard_frames: int = VAU_PREDECLARED["storyboard_frames"]
+    storyboard_context: float = VAU_PREDECLARED["storyboard_context"]
+    allow_missing_videos: bool = False
+    api_bases: Dict[str, str] = field(default_factory=dict)
+    limit: Optional[int] = None
+    official_repo: str = ""
+    official_python: str = ""               # interpreter for the official scripts (pandas < 3)
+    judge: bool = False                     # run VAU-Eval (needs the judge API)
+    judge_backend: str = "openai"           # 'openai' | 'mock'
+    judge_api_base: str = "https://api.deepseek.com"
+    judge_model: str = "deepseek-chat"
+    judge_api_key: str = ""
+    judge_temperature: Optional[float] = None    # None = provider default (as official)
+    judge_retries: int = 2
+
+    @property
+    def partial(self) -> bool:
+        return bool(self.limit)
+
+    @property
+    def run_tag(self) -> str:
+        return f"partial_limit{self.limit}" if self.limit else "full"
+
+    def rule(self) -> Dict[str, Any]:
+        return {k: getattr(self, k) for k in VAU_PREDECLARED}
+
+    def predeclared(self) -> bool:
+        return self.rule() == VAU_PREDECLARED
+
+    @property
+    def rule_tag(self) -> str:
+        return ("predeclared" if self.predeclared()
+                else "rule_" + sha1(json.dumps(self.rule(), sort_keys=True))[:10])
+
+
+def _vau_num(x: Any, what: str) -> float:
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        raise RuntimeError(f"{what}: expected a number, got {x!r}")
+    require(math.isfinite(v), f"{what}: expected a finite number, got {x!r}")
+    return v
+
+
+def vau_parse_rows(subset: str, rows: Sequence[Dict[str, Any]], path: str
+                   ) -> Tuple[List[VAUItem], Dict[str, VAUGroundTruth], Dict[str, Dict[str, str]]]:
+    """Schema-checked parser of one official test file. Values are kept verbatim
+    (the official evaluators compare strings); nothing is repaired or dropped."""
+    require(len(rows) > 0, f"{path}: no rows")
+    missing = [c for c in VAU_COLUMNS if c not in rows[0]]
+    require(not missing, f"{path} is not a VAU-Bench annotation file: missing columns {missing} "
+                         f"(expected {list(VAU_COLUMNS)})")
+    items: List[VAUItem] = []
+    gts: Dict[str, VAUGroundTruth] = {}
+    raw: Dict[str, Dict[str, str]] = {}
+    for n, r in enumerate(rows):
+        r = {k: ("" if r.get(k) is None else str(r.get(k))) for k in VAU_COLUMNS}
+        name = r["Video Name"]
+        require(name.lower().endswith(".mp4"), f"{path}: row {n} Video Name {name!r} lacks '.mp4' "
+                                               f"(the official evaluators key on the file name)")
+        require(name not in gts, f"{path}: duplicate Video Name {name!r}")
+        s = _vau_num(r["Start Time"], f"{path}: {name} Start Time")
+        e = _vau_num(r["End Time"], f"{path}: {name} End Time")
+        items.append(VAUItem(subset, name, r["Question"],
+                             (r["Option 1"], r["Option 2"], r["Option 3"], r["Option 4"])))
+        gts[name] = VAUGroundTruth(name, r["Correct Option"], r["Anomaly Class"], s, e,
+                                   r["Description"], r["Reasoning"], r["Key Object"])
+        raw[name] = r
+    return items, gts, raw
+
+
+def vau_read_csv(path: str) -> List[Dict[str, str]]:
+    import csv
+    with open(path, newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def vau_write_csv(path: str, header: Sequence[str], rows: Sequence[Sequence[Any]]) -> None:
+    import csv
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(list(header))
+        w.writerows([list(r) for r in rows])
+    os.replace(tmp, path)
+
+
+def vau_inputs_fingerprint(items: Sequence[VAUItem]) -> str:
+    blob = json.dumps([[q.video_name, q.question, list(q.options)] for q in items])
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+
+# -----------------------------------------------------------------------------
+# Annotation sources: official CSV directory, or the Hugging Face dataset
+# -----------------------------------------------------------------------------
+
+def vau_hf_annotation(vs: VAUSettings, subset: str) -> str:
+    """Download the official test CSV of `subset` from the HF dataset repository
+    (gated: run `huggingface-cli login` and accept the terms on the dataset page).
+    If the repository has no file with the official name, fall back to
+    datasets.load_dataset and take the split whose name contains the subset
+    key; the rows are written verbatim to <work>/vau_bench/annotations_from_hf/."""
+    want = VAU_TEST_FILES[subset]
+    files: List[str] = []
+    try:
+        from huggingface_hub import hf_hub_download, list_repo_files
+        files = list_repo_files(vs.hf_repo, repo_type="dataset", revision=vs.hf_revision or None)
+        hit = sorted(f for f in files if os.path.basename(f) == want)
+        if hit:
+            return hf_hub_download(vs.hf_repo, hit[0], repo_type="dataset",
+                                   revision=vs.hf_revision or None)
+    except ImportError:
+        LOG.warning("huggingface_hub is not installed; trying datasets.load_dataset")
+    except Exception as e:
+        raise RuntimeError(f"cannot read {vs.hf_repo} from the Hugging Face Hub ({type(e).__name__}: "
+                           f"{e}). The dataset is gated: run `huggingface-cli login`, accept the "
+                           f"terms on https://huggingface.co/datasets/{vs.hf_repo}, or pass "
+                           f"--vau_source local --vau_annotations_dir <VAU-R1>/annotations")
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        raise RuntimeError(f"{vs.hf_repo} has no file named {want} (files: {files[:20]}) and the "
+                           f"'datasets' package is not installed; pip install datasets, or pass "
+                           f"--vau_annotations_dir with the official CSVs")
+    dd = load_dataset(vs.hf_repo, revision=vs.hf_revision or None)
+    key = {"msad": "msad", "ucf": "ucf", "ecva": "ecva"}[subset]
+    splits = [s for s in dd if key in s.lower()]
+    require(len(splits) == 1,
+            f"{vs.hf_repo}: cannot identify the {VAU_DISPLAY[subset]} test split (splits "
+            f"{ {s: dd[s].num_rows for s in dd} }, columns {dd[next(iter(dd))].column_names}). "
+            f"Subsets are never inferred from file-name patterns; pass --vau_{subset}_annotations "
+            f"or --vau_annotations_dir with the official CSVs (GVCLab/VAU-R1 annotations/)")
+    rows = [dict(r) for r in dd[splits[0]]]
+    out = os.path.join(vau_paths(vs)["hf_annotations"], want)
+    vau_write_csv(out, VAU_COLUMNS, [[r.get(c, "") for c in VAU_COLUMNS] for r in rows])
+    LOG.info("%s: split %r of %s (%d rows) written to %s", VAU_DISPLAY[subset], splits[0],
+             vs.hf_repo, len(rows), out)
+    return out
+
+
+def vau_find_annotation(vs: VAUSettings, subset: str) -> str:
+    explicit = vs.subset_annotations.get(subset)
+    if explicit:
+        require(os.path.isfile(explicit), f"{VAU_DISPLAY[subset]} annotation file not found: "
+                                          f"{explicit}")
+        return os.path.abspath(explicit)
+    if vs.source == "hf":
+        return vau_hf_annotation(vs, subset)
+    require(bool(vs.annotations_dir),
+            f"no annotation source for {VAU_DISPLAY[subset]}: pass --vau_annotations_dir (the "
+            f"annotations/ folder of https://github.com/GVCLab/VAU-R1), --vau_{subset}_annotations, "
+            f"or --vau_source hf. VideoGlitchBench and UAL-Bench are never used as a fallback.")
+    cands = [os.path.join(vs.annotations_dir, VAU_TEST_FILES[subset]),
+             os.path.join(vs.annotations_dir, "annotations", VAU_TEST_FILES[subset])]
+    hit = next((c for c in cands if os.path.isfile(c)), None)
+    require(hit is not None, f"{VAU_DISPLAY[subset]} test annotations ({VAU_TEST_FILES[subset]}) not "
+                             f"found; looked in {cands}")
+    return os.path.abspath(hit)
+
+
+_VAU_VIDEO_SUBDIRS = {"msad": ("msad", "MSAD", "msad_test", "MSAD_test"),
+                      "ucf": ("ucf", "ucf_crime", "UCF-Crime", "UCF_Crime", "ucf-crime", "UCF"),
+                      "ecva": ("ecva", "ECVA")}
+
+
+def vau_video_dirs(vs: VAUSettings, subset: str) -> List[str]:
+    if vs.subset_videos.get(subset):
+        return [os.path.abspath(vs.subset_videos[subset])]
+    out: List[str] = []
+    if vs.video_root:
+        out += [os.path.join(vs.video_root, d) for d in _VAU_VIDEO_SUBDIRS[subset]]
+        if len(vs.subsets) == 1:
+            out.append(vs.video_root)
+    return list(dict.fromkeys(os.path.abspath(d) for d in out))
+
+
+def vau_index_videos(dirs: Sequence[str], wanted: set) -> Dict[str, Optional[str]]:
+    """Recursive basename index (UCF-Crime ships class sub-folders). A name found
+    twice with different sizes is an error, never a silent choice."""
+    found: Dict[str, List[str]] = defaultdict(list)
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        for dp, _, fs in os.walk(d, followlinks=True):
+            for f in fs:
+                if f in wanted:
+                    found[f].append(os.path.join(dp, f))
+    out: Dict[str, Optional[str]] = {}
+    for name in sorted(wanted):
+        ps = sorted(dict.fromkeys(os.path.realpath(p) for p in found.get(name, [])))
+        if len({os.path.getsize(p) for p in ps}) > 1:
+            raise RuntimeError(f"video {name} is ambiguous: {ps}; point --vau_<subset>_videos at "
+                               f"one directory")
+        out[name] = ps[0] if ps else None
+    return out
+
+
+def vau_load_dataset(vs: VAUSettings, subset: str) -> VAUDataset:
+    path = vau_find_annotation(vs, subset)
+    with open(path, "rb") as f:
+        sha = hashlib.sha256(f.read()).hexdigest()
+    items, gts, raw = vau_parse_rows(subset, vau_read_csv(path), path)
+    dirs = vau_video_dirs(vs, subset)
+    vp = vau_index_videos(dirs, {q.video_name for q in items})
+    return VAUDataset(subset, path, sha, vau_inputs_fingerprint(items), items, gts, raw, vp, dirs,
+                      vs.source)
+
+
+def vau_select_items(ds: VAUDataset, limit: Optional[int]) -> List[VAUItem]:
+    """The first `limit` rows in official annotation order (deterministic)."""
+    return list(ds.items[:limit]) if limit else list(ds.items)
+
+
+def vau_check_media(ds: VAUDataset, items: Sequence[VAUItem], allow_missing: bool) -> List[str]:
+    missing = sorted(q.video_name for q in items if ds.video_paths.get(q.video_name) is None)
+    if missing:
+        msg = (f"{VAU_DISPLAY[ds.subset]}: {len(missing)} of {len(items)} videos not found in "
+               f"{ds.video_dirs} (e.g. {missing[:3]}). Download the original {VAU_DISPLAY[ds.subset]} "
+               f"videos (see https://github.com/GVCLab/VAU-R1#2-prepare-the-training-data) and pass "
+               f"--vau_video_root or --vau_{ds.subset}_videos")
+        require(allow_missing, msg + ", or --vau_allow_missing_videos to score them as wrong "
+                                     "answers / zero-length spans (never as abstentions)")
+        LOG.warning("%s; %d videos scored as failures (--vau_allow_missing_videos)", msg,
+                    len(missing))
+    return missing
+
+
+def _vau_counts(values: Sequence[Any]) -> Dict[str, int]:
+    out: Dict[str, int] = defaultdict(int)
+    for v in values:
+        out[str(v)] += 1
+    return dict(sorted(out.items()))
+
+
+def vau_annotation_audit(ds: VAUDataset) -> Dict[str, Any]:
+    """Counts behind the protocol notes at the top of this block (GT statistics;
+    evaluator-side only)."""
+    g = list(ds.gt.values())
+    lens = [x.end_time - x.start_time for x in g if x.tag_valid]
+    return {
+        "n_rows": len(g),
+        "tag_skipped_normal_(0,0)": sum(x.tag_normal for x in g),
+        "tag_scored_by_official_script": sum(not x.tag_normal for x in g),
+        "tag_scored_valid_gt": sum((not x.tag_normal) and x.tag_valid for x in g),
+        "tag_rows_without_valid_interval_scored_as_iou0": sum((not x.tag_normal) and not x.tag_valid
+                                                             for x in g),
+        "qa_unanswerable_-1": sum(x.correct_option == "-1" for x in g),
+        "qa_correct_option_malformed": [x.correct_option for x in g
+                                        if x.correct_option not in ("A", "B", "C", "D", "-1")],
+        "qa_answer_key_distribution": _vau_counts(
+            [x.correct_option if x.correct_option in ("A", "B", "C", "D", "-1") else "malformed"
+             for x in g]),
+        "cls_class_distribution": _vau_counts([x.anomaly_class for x in g]),
+        "cls_class_not_in_fixed_options": sorted({x.anomaly_class for x in g
+                                                  if x.anomaly_class not in VAU_CLASSES}),
+        "(0,0)_but_class_not_Normal": sum(x.tag_normal and x.anomaly_class != "Normal" for x in g),
+        "valid_interval_but_class_Normal": sum(x.tag_valid and x.anomaly_class == "Normal" for x in g),
+        "gt_interval_length_mean_median_min_max": ([float(np.mean(lens)), float(np.median(lens)),
+                                                    min(lens), max(lens)] if lens else None),
+    }
+
+
+# -----------------------------------------------------------------------------
+# Isolation: work root, paths, cache namespace, VLM wrappers
+# -----------------------------------------------------------------------------
+
+def vau_resolve_work_root(vs: VAUSettings, cfg: Config) -> str:
+    """Default: a sibling 'HOVER_v10_vau_work' of --vau_annotations_dir. Refuses any
+    location inside VideoGlitchBench, its work dir, the GliDe repository or the
+    VAU-Bench annotations / videos."""
+    if vs.work_root:
+        w = vs.work_root
+    else:
+        require(bool(vs.annotations_dir), "pass --vau_work_root (or --vau_annotations_dir, whose "
+                                          "sibling 'HOVER_v10_vau_work' is then used)")
+        w = os.path.join(os.path.dirname(os.path.abspath(vs.annotations_dir.rstrip(os.sep))),
+                         "HOVER_v10_vau_work")
+    w = os.path.abspath(w)
+    protected = [("VideoGlitchBench root (--root)", cfg.root),
+                 ("VideoGlitchBench work dir", cfg.paths()["work"])]
+    if cfg.glide_repo:
+        protected.append(("GliDe repository (--glide_repo)", cfg.glide_repo))
+    if vs.annotations_dir:
+        protected.append(("VAU-Bench annotation directory", vs.annotations_dir))
+    for d in [vs.video_root, *vs.subset_videos.values()]:
+        if d:
+            protected.append(("VAU-Bench video directory", d))
+    for p in vs.subset_annotations.values():
+        protected.append(("VAU-Bench annotation directory", os.path.dirname(os.path.abspath(p))))
+    if vs.official_repo:
+        protected.append(("VAU-R1 repository (--vau_repo)", vs.official_repo))
+    for name, d in protected:
+        require(not _ual_within(w, d), f"refusing VAU work root {w}: it lies inside the {name} "
+                                       f"{d}; pass --vau_work_root outside it")
+    return w
+
+
+def vau_paths(vs: VAUSettings, subset: str = "", backbone: str = "") -> Dict[str, str]:
+    base = os.path.join(vs.work_root, "vau_bench")
+    out = {"base": base, "logs": os.path.join(base, "logs"),
+           "inspect": os.path.join(base, "inspect"),
+           "hf_annotations": os.path.join(base, "annotations_from_hf"),
+           "judge_cache": os.path.join(base, "judge_cache",
+                                       re.sub(r"[^A-Za-z0-9_.-]", "_", vs.judge_model)),
+           "summary": os.path.join(base, "summary", vs.rule_tag, vs.run_tag)}
+    if subset:
+        out["subset"] = os.path.join(base, subset)
+    if subset and backbone:
+        out["cache"] = os.path.join(base, subset, "cache", backbone)
+        out["run"] = os.path.join(base, subset, backbone, vs.rule_tag, vs.run_tag)
+    return out
+
+
+def vau_prep_config(cfg: Config, vs: VAUSettings, subset: str) -> Config:
+    """paths() of this Config point into <work>/vau_bench/<subset>/, so the
+    unchanged prepare_record writes windows there."""
+    return Config(**{**asdict(cfg), "root": vs.work_root, "fps": float(vs.fps),
+                     "work_subdir": os.path.join("vau_bench", subset)})
+
+
+def vau_cache_namespace(cfg: Config, ds: VAUDataset) -> Dict[str, Any]:
+    """Part of every VAU VLM cache key; GT-free (inputs fingerprint, not the
+    annotation hash)."""
+    return {"dataset": f"vau_bench/{ds.subset}", "inputs": ds.inputs_fingerprint,
+            "adapter": VAU_ADAPTER_VERSION, "prompt": VAU_PROMPT_VERSION, "HOVER": VERSION,
+            "prep": cfg.prep_fingerprint(), "backbone": cfg.backbone, "model": cfg.model,
+            "top_logprobs": cfg.top_logprobs, "sampling": build_generation_kwargs(cfg, 1)}
+
+
+def _vau_letter_options(options: Dict[str, Sequence[str]]) -> bool:
+    return all(len(w) == 1 and w.isupper() for ws in options.values() for w in ws)
+
+
+def vau_match_letter_logprobs(top: Sequence[Dict], options: Dict[str, Sequence[str]]
+                              ) -> Tuple[Dict[str, float], bool]:
+    """match_top_logprobs with case-sensitive letters ('a' and 'I' are words)."""
+    lps = [float(t["logprob"]) for t in top]
+    floor = min(lps) if lps else -30.0
+    out, truncated = {}, False
+    for opt, words in options.items():
+        got = [float(t["logprob"]) for t in top if str(t.get("token", "")).strip() in set(words)]
+        if got:
+            out[opt] = float(logsumexp(got))
+        else:
+            out[opt], truncated = floor, True
+    return out, truncated
+
+
+class _VAUMixin:
+    """Namespaced cache keys, case-sensitive letter options and multi-turn chat."""
+    vau_namespace: Dict[str, Any] = {}
+
+    def _key(self, kind, system, user, images, extra):
+        return sha1(json.dumps({"vau": self.vau_namespace,
+                                "k": super()._key(kind, system, user, images, extra)},
+                               sort_keys=True))
+
+    def chat(self, system: str, turns: Sequence[str], images: Sequence[str] = (),
+             max_tokens: int = 512, stage: str = "other") -> List[str]:
+        """One conversation; the images are attached to the first user turn and
+        every reply is fed back, as in the official two-turn reasoning script."""
+        replies: List[str] = []
+        for t, user in enumerate(turns):
+            hist = [[turns[j], replies[j]] for j in range(t)]
+            extra = {**build_generation_kwargs(self.cfg, max_tokens), "history": hist}
+            key = self._key("chat", system, user, images, extra)
+            hit = self._cached(key)
+            if hit is not None:
+                self._count(stage, True)
+                replies.append(hit)
+                continue
+            out = self._chat(system, hist, user, images, max_tokens)
+            self._count(stage, False)
+            self._store(key, out)
+            replies.append(out)
+        return replies
+
+
+class VAUOpenAIVLM(_VAUMixin, OpenAIVLM):
+    def _score(self, system, user, images, options) -> Dict[str, float]:
+        if not _vau_letter_options(options):
+            return super()._score(system, user, images, options)
+        user_content = self._content(user, images)
+        if not isinstance(user_content, list):
+            user_content = [{"type": "text", "text": user_content}]
+        payload = {"model": self.cfg.model, "max_tokens": 1, "temperature": 0.0,
+                   "logprobs": True, "top_logprobs": int(self.cfg.top_logprobs),
+                   "messages": [{"role": "system", "content": [{"type": "text", "text": system}]},
+                                {"role": "user", "content": user_content}]}
+        d = self._post(payload)
+        self.budget.prompt_tokens += int((d.get("usage") or {}).get("prompt_tokens", 0) or 0)
+        content = ((d["choices"][0].get("logprobs") or {}).get("content") or [])
+        require(content, "server returned no logprobs; start vLLM with --max-logprobs >= "
+                         "top_logprobs")
+        out, trunc = vau_match_letter_logprobs(content[0].get("top_logprobs") or [], options)
+        self.budget.logprob_truncations += int(trunc)
+        return out
+
+    def _chat(self, system, hist, user, images, max_tokens) -> str:
+        g = build_generation_kwargs(self.cfg, max_tokens)
+        msgs: List[Dict[str, Any]] = [{"role": "system", "content": [{"type": "text", "text": system}]}]
+        for j, u in enumerate([h[0] for h in hist] + [user]):
+            c = self._content(u, images if j == 0 else [])
+            msgs.append({"role": "user", "content": c if isinstance(c, list)
+                         else [{"type": "text", "text": c}]})
+            if j < len(hist):
+                msgs.append({"role": "assistant", "content": [{"type": "text", "text": hist[j][1]}]})
+        payload = {"model": self.cfg.model, "max_tokens": int(max_tokens),
+                   "temperature": float(self.cfg.temperature), "top_p": g["top_p"],
+                   "top_k": g["top_k"] if g["top_k"] > 0 else -1,
+                   "repetition_penalty": g["repetition_penalty"], "messages": msgs}
+        d = self._post(payload)
+        u_ = d.get("usage") or {}
+        self.budget.prompt_tokens += int(u_.get("prompt_tokens", 0) or 0)
+        self.budget.completion_tokens += int(u_.get("completion_tokens", 0) or 0)
+        return str(d["choices"][0]["message"]["content"] or "").strip()
+
+
+class VAUHFVLM(_VAUMixin, HFVLM):
+    def _first_ids(self, words: Sequence[str]) -> List[int]:
+        if not all(len(w) == 1 and w.isupper() for w in words):
+            return super()._first_ids(words)
+        key = ("__letters__",) + tuple(words)
+        if key not in self._opt_ids:
+            tok, ids = self._proc.tokenizer, set()
+            for w in words:
+                for s in (w, " " + w):
+                    t = tok.encode(s, add_special_tokens=False)
+                    if t:
+                        ids.add(int(t[0]))
+            self._opt_ids[key] = sorted(ids)
+        return self._opt_ids[key]
+
+    def _chat(self, system, hist, user, images, max_tokens) -> str:
+        import torch
+        from PIL import Image
+        from transformers import GenerationConfig
+        self._lazy()
+        pil = [Image.open(p).convert("RGB") for p in images]
+        msgs: List[Dict[str, Any]] = [{"role": "system", "content": [{"type": "text", "text": system}]}]
+        for j, u in enumerate([h[0] for h in hist] + [user]):
+            msgs.append({"role": "user", "content": [{"type": "text", "text": u}]
+                         + ([{"type": "image"} for _ in pil] if j == 0 else [])})
+            if j < len(hist):
+                msgs.append({"role": "assistant", "content": [{"type": "text", "text": hist[j][1]}]})
+        text = self._proc.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        inp = self._proc(text=[text], images=pil or None, return_tensors="pt",
+                         padding=True).to(self._model.device)
+        gc = GenerationConfig(**build_generation_kwargs(self.cfg, max_tokens),
+                              eos_token_id=self._model.generation_config.eos_token_id,
+                              pad_token_id=self._model.generation_config.pad_token_id)
+        with torch.no_grad():
+            out = self._model.generate(**inp, generation_config=gc)
+        gen = out[0][inp["input_ids"].shape[1]:]
+        self.budget.prompt_tokens += int(inp["input_ids"].shape[1])
+        self.budget.completion_tokens += int(gen.shape[0])
+        return self._proc.decode(gen, skip_special_tokens=True).strip()
+
+
+class VAUMockVLM(_VAUMixin, MockVLM):
+    def _chat(self, system, hist, user, images, max_tokens) -> str:
+        return str(self.oracle("chat", system, user, list(images), hist))
+
+
+def make_vau_vlm(cfg: Config, cache_dir: str, namespace: Dict[str, Any],
+                 oracle: Optional[Callable] = None) -> VLMBase:
+    if cfg.backend == "openai":
+        v: VLMBase = VAUOpenAIVLM(cfg, cache_dir)
+    elif cfg.backend == "hf":
+        v = VAUHFVLM(cfg, cache_dir)
+    elif cfg.backend == "mock":
+        require(oracle is not None, "mock backend needs an oracle")
+        v = VAUMockVLM(cfg, cache_dir, oracle)
+    else:
+        raise ValueError(f"unknown backend {cfg.backend}")
+    v.vau_namespace = dict(namespace)
+    return v
+
+
+def _vau_switch_subset(vlm: VLMBase, cache_dir: str, namespace: Dict[str, Any]) -> None:
+    os.makedirs(cache_dir, exist_ok=True)
+    vlm.cache_dir = cache_dir
+    vlm.vau_namespace = dict(namespace)
+
+
+def vau_resolve_backbones(spec: Optional[str], default_all: bool = False) -> List[str]:
+    if not spec:
+        require(default_all, f"pass --backbone {{{','.join(VAU_BACKBONES)},all}}")
+        return list(VAU_BACKBONES)
+    keys = list(VAU_BACKBONES) if spec == "all" else [s.strip() for s in spec.split(",") if s.strip()]
+    for k in keys:
+        require(k in VAU_BACKBONES, f"backbone {k!r} is not part of the VAU-Bench experiment; "
+                                    f"allowed: {sorted(VAU_BACKBONES)} or 'all'")
+        require(BACKBONES[k]["hf"] == VAU_BACKBONES[k][1],
+                f"BACKBONES[{k!r}] = {BACKBONES[k]['hf']} differs from {VAU_BACKBONES[k][1]}")
+    return list(dict.fromkeys(keys))
+
+
+def vau_backbone_config(cfg: Config, key: str, vs: VAUSettings, model_override: str = "") -> Config:
+    c = cfg.with_backbone(key)
+    require(not model_override or model_override == c.model,
+            f"--model {model_override} would replace the checkpoint {c.model} of {key}; the "
+            f"VAU-Bench experiment never substitutes checkpoints")
+    c.fps = float(vs.fps)
+    if key in vs.api_bases:
+        c.api_base = vs.api_bases[key]
+    return c
+
+
+def vau_preflight_backbone(c: Config) -> Dict[str, Any]:
+    try:
+        return ual_preflight_backbone(c)       # same checks; only the flag name differs
+    except RuntimeError as e:
+        raise RuntimeError(str(e).replace("--ual_api_bases", "--vau_api_bases"))
+
+
+# -----------------------------------------------------------------------------
+# HOVER-VAU inference (ground truth never passes through these functions)
+# -----------------------------------------------------------------------------
+
+def vau_prepare_video(cfg: Config, vs: VAUSettings, ds: VAUDataset, name: str, memo: Dict
+                      ) -> Tuple[List[Window], float]:
+    key = (ds.subset, cfg.prep_fingerprint(), name)
+    if key not in memo:
+        path = ds.video_paths.get(name)
+        try:
+            require(path is not None, f"video {name} not found")
+            shim = _UALVideo(ual_video_key("vau_" + ds.subset, name, path), str(path))
+            wins = prepare_record(shim, vau_prep_config(cfg, vs, ds.subset))
+            memo[key] = (wins, float(shim.duration or (wins[-1].end if wins else 0.0)))
+        except Exception as e:
+            memo[key] = e
+    val = memo[key]
+    if isinstance(val, Exception):
+        raise val
+    return val
+
+
+def vau_profile(vlm: VLMBase, wins: Sequence[Window], system: str, user: str, cfg: Config,
+                stage: str) -> Tuple[float, List[float]]:
+    """HOVER V for one question: calibrated log-odds of 'Yes' per window."""
+    def lo_of(path: str, st: str) -> float:
+        return binary_log_odds(vlm.score(system, user, [path], YES_NO, st), "yes", "no")
+    prior = 0.0
+    if cfg.use_contextual_calibration:
+        prior = lo_of(content_free_path(wins) if vlm.needs_pixels else "__content_free__",
+                      stage + "_calib")
+    return prior, [lo_of(w.stitch_path, stage) - prior for w in wins]
+
+
+class VAUPresenceOracle(PresenceOracle):
+    """PresenceOracle with a given (system, user) question; the prior of the
+    profile is reused so that oracle and profile share one zero point."""
+
+    def __init__(self, vlm: VLMBase, wins: Sequence[Window], system: str, user: str,
+                 cfg: Config, margin: float, prior: float):
+        self.vlm, self.cfg, self.margin = vlm, cfg, float(margin)
+        self.by_idx = {w.idx: w for w in wins}
+        self.system, self.usr = system, user
+        self.base = float(prior) if cfg.use_contextual_calibration else 0.0
+        self.memo: Dict[Any, bool] = {}
+
+    def image(self, path: str, stage: str = "vau_g_frame") -> bool:
+        if path not in self.memo:
+            lo = binary_log_odds(self.vlm.score(self.system, self.usr, [path], YES_NO, stage),
+                                 "yes", "no")
+            self.memo[path] = (lo - self.base) > self.margin
+        return self.memo[path]
+
+
+def vau_location_posterior(s: Sequence[float]) -> np.ndarray:
+    """P(z = w | V) = softmax_w s(w) (single evidence location, uniform prior)."""
+    x = np.asarray(s, float)
+    require(x.size > 0 and np.all(np.isfinite(x)), "location posterior needs a finite profile")
+    p = np.exp(x - x.max())
+    return p / p.sum()
+
+
+def vau_occam_window(s: Sequence[float], mass: float, kmax: int
+                     ) -> Tuple[List[int], np.ndarray, float]:
+    """Fewest windows whose posterior mass reaches `mass` (at most kmax); returns
+    the windows in temporal order, their renormalised weights and the mass kept."""
+    p = vau_location_posterior(s)
+    order = np.argsort(-p, kind="mergesort")
+    cum = np.cumsum(p[order])
+    k = int(min(np.searchsorted(cum, mass - 1e-12) + 1, max(1, kmax), p.size))
+    sel = sorted(int(i) for i in order[:k])
+    w = p[sel] / p[sel].sum()
+    return sel, w, float(p[sel].sum())
+
+
+def vau_option_posterior(vlm: VLMBase, wins: Sequence[Window], sel: Sequence[int],
+                         weights: Sequence[float], system: str, user: str, letters: str,
+                         calibrate: bool, stage: str) -> Dict[str, Any]:
+    """P(option | V) = sum_w P(z = w | V) P(option | w) over Occam's window."""
+    opts = {L: [L] for L in letters}
+    per = [vlm.score(system, user, [wins[i].stitch_path], opts, stage) for i in sel]
+    if calibrate:
+        cf = vlm.score(system, user, [content_free_path(wins) if vlm.needs_pixels
+                                      else "__content_free__"], opts, stage + "_calib")
+        per = [normalise_option_logprobs({L: lp[L] - cf[L] for L in letters}) for lp in per]
+    post = {L: float(sum(w * math.exp(lp[L]) for w, lp in zip(weights, per))) for L in letters}
+    z = sum(post.values())
+    post = {L: v / z for L, v in post.items()}
+    best = max(letters, key=lambda L: (post[L], -letters.index(L)))
+    return {"answer": best, "posterior": post, "windows": list(sel),
+            "weights": [float(x) for x in weights]}
+
+
+def vau_storyboard(wins: Sequence[Window], t0: float, t1: float, n: int,
+                   quality: int = 95) -> Tuple[str, List[int]]:
+    """Up to n decoded frames evenly spaced in [t0, t1), cropped from the stitched
+    windows and re-stitched with the official geometry (one image per prompt)."""
+    frames = [(t, fid, wi, k) for wi, w in enumerate(wins)
+              for k, (fid, t) in enumerate(zip(w.frame_ids, w.frame_times))]
+    inside = [f for f in frames if t0 <= f[0] < t1] or [min(frames, key=lambda f: abs(f[0] - t0))]
+    idx = sorted(set(np.linspace(0, len(inside) - 1, min(n, len(inside))).round().astype(int)))
+    pick = [inside[i] for i in idx]
+    ids = [int(p[1]) for p in pick]
+    out = os.path.join(os.path.dirname(wins[0].stitch_path),
+                       f"storyboard_{sha1(json.dumps(ids))[:12]}.jpg")
+    if not os.path.exists(out):
+        cells: Dict[int, List[np.ndarray]] = {}
+        for wi in sorted({p[2] for p in pick}):
+            img = cv2.imread(wins[wi].stitch_path)
+            require(img is not None, f"cannot read {wins[wi].stitch_path}")
+            cells[wi] = _split_cells(img, len(wins[wi].frame_ids))[0]
+        st = stitch_official([cells[p[2]][p[3]] for p in pick], ids)
+        require(cv2.imwrite(out, st, [cv2.IMWRITE_JPEG_QUALITY, quality]), f"failed to write {out}")
+    return out, ids
+
+
+def vau_infer_video(vlm: VLMBase, q: VAUItem, wins: Sequence[Window], duration: float,
+                    cfg: Config, vs: VAUSettings) -> Dict[str, Any]:
+    """HOVER-VAU for one video: E -> H (class BMA) -> V -> S + G -> QA BMA -> R.
+    Inputs: the question/options, the windows and the decoded duration only."""
+    require(len(wins) > 0, f"{q.video_name}: no windows")
+    audit = {"monotonicity_violations": 0, "frame_conflicts": 0}
+    prior_e, s_e = vau_profile(vlm, wins, P_VAU_ANOMALY_SYS, vau_anomaly_user(), cfg, "vau_e")
+    sel, w, mass_c = vau_occam_window(s_e, vs.bma_mass, vs.bma_max_windows)
+    cls = vau_option_posterior(vlm, wins, sel, w, P_VAU_CLS_SYS, vau_cls_user(), VAU_LETTERS,
+                               vs.option_calibration, "vau_cls")
+    c_hat = VAU_CLASSES[VAU_LETTERS.index(cls["answer"])]
+    if vs.tag_profile == "hypothesis" and c_hat != "Normal":
+        usr, src = vau_class_user(c_hat), "hypothesis"
+        prior, s = vau_profile(vlm, wins, P_VAU_ANOMALY_SYS, usr, cfg, "vau_v")
+    else:
+        usr, src, prior, s = vau_anomaly_user(), "generic", prior_e, s_e
+    tau, lam = float(vs.seg_tau), float(vs.seg_penalty)
+    (a, b), segs = ual_select_segment(s, tau, lam)
+    lo_t, hi_t = wins[a].start, wins[b].end
+    window_span = [float(lo_t), float(hi_t)]
+    if vs.refine_mode == "frame" and cfg.use_subframe:
+        oracle = VAUPresenceOracle(vlm, wins, P_VAU_ANOMALY_SYS, usr, cfg, tau, prior)
+        v = cfg.use_verified_bisection
+        on_t, off_t = lo_t, hi_t
+        if s[a] > tau:
+            k = frame_onset(oracle, wins[a], audit, v)
+            on_t = frame_time_bounds(wins[a], k, k, cfg.fps)[0]
+        if s[b] > tau:
+            k = frame_offset(oracle, wins[b], audit, v)
+            off_t = frame_time_bounds(wins[b], k, k, cfg.fps)[1]
+        if off_t > on_t:
+            lo_t, hi_t = on_t, off_t
+        else:
+            audit["frame_conflicts"] += 1
+    ps, pe = clamp(float(lo_t), 0.0, duration), clamp(float(hi_t), 0.0, duration)
+    ok = pe > ps
+    out: Dict[str, Any] = {
+        "status": "ok" if ok else "degenerate_interval", "error": None,
+        "pred_start": round(ps, 6) if ok else None, "pred_end": round(pe, 6) if ok else None,
+        "cls_pred": c_hat, "cls_posterior": {VAU_CLASSES[VAU_LETTERS.index(L)]: p
+                                             for L, p in cls["posterior"].items()},
+        "cls_windows": cls["windows"], "cls_weights": cls["weights"], "cls_mass_kept": mass_c,
+        "decoded_duration": float(duration), "n_windows": len(wins),
+        "window_bounds": [[x.start, x.end] for x in wins],
+        "generic_prior": float(prior_e), "generic_profile": [float(x) for x in s_e],
+        "tag_profile_source": src, "tag_prior": float(prior), "tag_profile": [float(x) for x in s],
+        "segments": [list(x) for x in segs], "selected_segment": [a, b],
+        "window_span": window_span, "refine_mode": vs.refine_mode, **audit}
+    if "qa" in vs.tasks:
+        sel_q, w_q, mass_q = vau_occam_window(s, vs.bma_mass, vs.bma_max_windows)
+        qa = vau_option_posterior(vlm, wins, sel_q, w_q, P_VAU_QA_SYS, vau_qa_user(q),
+                                  VAU_QA_LETTERS, vs.option_calibration, "vau_qa")
+        out.update({"qa_pred": qa["answer"], "qa_posterior": qa["posterior"],
+                    "qa_windows": qa["windows"], "qa_weights": qa["weights"], "qa_mass_kept": mass_q})
+    if "reason" in vs.tasks:
+        if vs.reason_context == "hover":
+            a_, b_ = (ps, pe) if ok else window_span
+            m = vs.storyboard_context * (b_ - a_)
+            t0, t1 = max(0.0, a_ - m), min(duration, b_ + m)
+            system = vau_reason_system(t0, t1, duration, (c_hat, out["cls_posterior"][c_hat], a_, b_))
+        else:
+            t0, t1 = 0.0, duration
+            system = vau_reason_system(t0, t1, duration, None)
+        sb, ids = vau_storyboard(wins, t0, t1, vs.storyboard_frames)
+        desc, ana = vlm.chat(system, [VAU_DESCRIPTION_PROMPT, VAU_ANALYSIS_PROMPT], [sb],
+                             VAU_REASON_MAX_TOKENS, "vau_reason")
+        out.update({"description": desc, "analysis": ana, "storyboard_frame_ids": ids,
+                    "storyboard_span": [t0, t1], "reason_system": system})
+    return out
+
+
+def vau_smoke_test(vlm: VLMBase, c: Config, ds: VAUDataset, wins: Sequence[Window],
+                   q: VAUItem) -> Dict[str, Any]:
+    """One generic presence score and one 20-way letter score on a real window."""
+    try:
+        lo_w = binary_log_odds(vlm.score(P_VAU_ANOMALY_SYS, vau_anomaly_user(),
+                                         [wins[0].stitch_path], YES_NO, "vau_smoke"), "yes", "no")
+        lp = vlm.score(P_VAU_CLS_SYS, vau_cls_user(), [wins[0].stitch_path],
+                       {L: [L] for L in VAU_LETTERS}, "vau_smoke")
+    except Exception as e:
+        raise RuntimeError(f"smoke test failed for {c.backbone} ({c.model}, backend {c.backend}) "
+                           f"on {VAU_DISPLAY[ds.subset]} {q.video_name!r}: {type(e).__name__}: {e}")
+    require(math.isfinite(lo_w) and all(math.isfinite(v) for v in lp.values()),
+            f"smoke test for {c.backbone}: non-finite scores")
+    return {"video": q.video_name, "window_log_odds": lo_w,
+            "cls_top_letter": max(lp, key=lp.get)}
+
+
+def vau_run_backbone(c: Config, vs: VAUSettings, ds: VAUDataset, items: Sequence[VAUItem],
+                     vlm: VLMBase, memo: Dict, preflight: Dict, smoke: Optional[Dict]) -> str:
+    rp = vau_paths(vs, ds.subset, c.backbone)
+    os.makedirs(rp["run"], exist_ok=True)
+    out_path = os.path.join(rp["run"], "raw_outputs.json")
+    outs: List[Dict[str, Any]] = []
+    t0, b_calls = time.time(), vlm.budget.calls
+
+    def payload(done: bool) -> Dict[str, Any]:
+        return {"dataset": "vau_bench", "subset": ds.subset, "backbone": c.backbone,
+                "model": c.model, "rule": vs.rule(), "rule_tag": vs.rule_tag,
+                "tasks": list(vs.tasks), "partial": vs.partial, "limit": vs.limit,
+                "complete": done, "n_items": len(items),
+                "inputs_fingerprint": ds.inputs_fingerprint, "items": outs}
+    for i, q in enumerate(items):
+        before, st0, tr0 = vlm.budget.calls, dict(vlm.budget.by_stage), vlm.budget.logprob_truncations
+        rec: Dict[str, Any] = {"video_name": q.video_name}
+        try:
+            wins, dur = vau_prepare_video(c, vs, ds, q.video_name, memo)
+        except Exception as e:
+            st = "video_missing" if ds.video_paths.get(q.video_name) is None else "video_error"
+            if st == "video_error":
+                LOG.error("%s: cannot decode (%s: %s); scored as a failure", q.video_name,
+                          type(e).__name__, e)
+            rec.update({"status": st, "error": f"{type(e).__name__}: {e}", "pred_start": None,
+                        "pred_end": None, "decoded_duration": None, "cls_pred": None})
+        else:
+            rec.update(vau_infer_video(vlm, q, wins, dur, c, vs))   # VLM errors abort the run
+        rec["calls"] = vlm.budget.calls - before
+        rec["calls_by_stage"] = {k: v - st0.get(k, 0) for k, v in vlm.budget.by_stage.items()
+                                 if v - st0.get(k, 0) > 0}
+        rec["logprob_truncations"] = vlm.budget.logprob_truncations - tr0
+        outs.append(rec)
+        if (i + 1) % 10 == 0 or i + 1 == len(items):
+            LOG.info("%s | %s | %d/%d videos | %.1f calls/video | %.1f min", VAU_DISPLAY[ds.subset],
+                     c.backbone, i + 1, len(items), (vlm.budget.calls - b_calls) / (i + 1),
+                     (time.time() - t0) / 60)
+        if (i + 1) % 25 == 0:
+            atomic_write_json(out_path.replace(".json", ".inprogress.json"), payload(False))
+    atomic_write_json(out_path, payload(True))
+    ip = out_path.replace(".json", ".inprogress.json")
+    if os.path.exists(ip):
+        os.remove(ip)
+    atomic_write_json(os.path.join(rp["run"], "manifest.json"),
+                      vau_manifest(c, vs, ds, items, {"preflight": preflight, "smoke_test": smoke,
+                                                      "budget": asdict(vlm.budget)}))
+    LOG.info("wrote %s", out_path)
+    return out_path
+
+
+def vau_manifest(c: Config, vs: VAUSettings, ds: VAUDataset, items: Sequence[VAUItem],
+                 extra: Dict[str, Any]) -> Dict[str, Any]:
+    import platform
+    vers: Dict[str, Any] = {"python": sys.version.split()[0], "platform": platform.platform(),
+                            "numpy": np.__version__,
+                            "opencv": getattr(cv2, "__version__", None) if cv2 else None}
+    for mod in ("scipy", "torch", "transformers", "requests"):
+        if mod in sys.modules:
+            vers[mod] = getattr(sys.modules[mod], "__version__", None)
+    return {"HOVER_version": VERSION, "vau_adapter": VAU_ADAPTER_VERSION,
+            "prompt_version": VAU_PROMPT_VERSION, "subset": ds.subset,
+            "annotation_path": ds.annotation_path, "annotation_sha256": ds.annotation_sha256,
+            "inputs_fingerprint": ds.inputs_fingerprint, "video_dirs": ds.video_dirs,
+            "backbone": c.backbone, "model": c.model, "backend": c.backend,
+            "api_base": c.api_base if c.backend == "openai" else None,
+            "generation": build_generation_kwargs(c, 1), "top_logprobs": c.top_logprobs,
+            "max_pixels": c.max_pixels, "fps": c.fps, "window_size": c.window_size,
+            "prep_fingerprint": c.prep_fingerprint(), "seed": c.seed,
+            "HOVER_switches": {k: getattr(c, k) for k in asdict(c) if k.startswith("use_")},
+            "versions": vers, "argv": list(sys.argv),
+            "time_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "method": "HOVER-VAU: E -> H (class BMA over Occam's window) -> V -> S (K = 1) + "
+                      "masked-frame G -> QA BMA -> R (official prompts on a storyboard)",
+            "prompts": {"anomaly_system": P_VAU_ANOMALY_SYS, "anomaly_user": vau_anomaly_user(),
+                        "class_user_template": vau_class_user("{class}"),
+                        "cls_system": P_VAU_CLS_SYS, "cls_user": vau_cls_user(),
+                        "qa_system": P_VAU_QA_SYS, "qa_user_template": _VAU_QA_TEMPLATE,
+                        "reason_turns": [VAU_DESCRIPTION_PROMPT, VAU_ANALYSIS_PROMPT]},
+            "rule": vs.rule(), "predeclared": vs.predeclared(), "calibrated_on_vau": False,
+            "tasks": list(vs.tasks), "source": ds.source, "n_items": len(items),
+            "n_items_in_annotation": len(ds.items), "partial": vs.partial, "limit": vs.limit,
+            **extra}
+
+
+# -----------------------------------------------------------------------------
+# Official VAU-R1 evaluators: exact ports of src/evaluation/*.py
+# -----------------------------------------------------------------------------
+
+def _vau_round(value: float, decimal_places: int = 4) -> float:
+    """_round of evaluation_tag.py / evaluation_cls.py: round(v, 4) * 100."""
+    return round(value, decimal_places) * 100
+
+
+def vau_time_to_seconds(time_str: Any) -> float:
+    """evaluation_tag.py time_to_seconds, verbatim."""
+    from datetime import datetime
+    if isinstance(time_str, (int, float)):
+        return time_str
+    n = len(time_str.split(":"))
+    if len(time_str.split(".")) > 2:
+        time_str = ".".join(time_str.split(".")[:2])
+    fl = len(time_str.split(".")) == 2
+    if n == 3:
+        t = datetime.strptime(time_str, "%H:%M:%S" + (".%f" if fl else ""))
+        return t.hour * 3600 + t.minute * 60 + t.second + t.microsecond / 1_000_000
+    if n == 2:
+        t = datetime.strptime(time_str, "%M:%S" + (".%f" if fl else ""))
+        return t.minute * 60 + t.second + t.microsecond / 1_000_000
+    t = datetime.strptime(time_str, "%S" + (".%f" if fl else ""))
+    return t.second + t.microsecond / 1_000_000
+
+
+def vau_parse_glue(response: str) -> Tuple[float, float]:
+    """evaluation_tag.py parse_html, verbatim: <glue>[s, e]</glue>, else the
+    first [...], else (0, 0); malformed numbers raise like the original."""
+    glue = re.search(r"<glue>(.*?)</glue>", response)
+    if not glue:
+        glue = re.search(r"\[(.*?)\]", response)
+        if not glue:
+            return 0.0, 0.0
+    ts = re.sub(r"[^0-9:.,-]", "", glue.group(1))
+    if len(ts.split(",")) != 2:
+        return 0.0, 0.0
+    st, ed = ts.split(",")
+    if ":" in st and ":" in ed:
+        return vau_time_to_seconds(st), vau_time_to_seconds(ed)
+    return float(st), float(ed)
+
+
+def vau_tag_iou(gs: float, ge: float, ps: float, pe: float) -> float:
+    """TemporalEvaluator.eval_IoU: hull union; equal endpoints = no detection."""
+    if ps == pe:
+        return 0
+    inter = max(0, min(ge, pe) - max(gs, ps))
+    union = max(ge, pe) - min(gs, ps)
+    return inter / union if union > 0 else 0
+
+
+def vau_dedup_preds(rows: Sequence[Sequence[Any]]) -> List[Tuple[Any, ...]]:
+    """drop_duplicates(subset=['Video Name'], keep='first')."""
+    seen, out = set(), []
+    for r in rows:
+        if r[0] not in seen:
+            seen.add(r[0])
+            out.append(tuple(r))
+    return out
+
+
+def vau_official_tag(gt: Dict[str, VAUGroundTruth], pred_rows: Sequence[Tuple[str, str]],
+                     valid_only: bool = False) -> Dict[str, Any]:
+    """TemporalEvaluator.evaluate. valid_only=True additionally skips GT rows
+    without a usable interval ((-1, -1)): NOT the official script, reported as
+    the 'valid GT' variant."""
+    ious: List[float] = []
+    per: Dict[str, float] = {}
+    rec = {t: 0 for t in VAU_RECALLS}
+    rows = []
+    for name, resp in vau_dedup_preds(pred_rows):     # dedup on the RAW name, then '.mp4'
+        name = str(name).strip()
+        rows.append((name if name.endswith(".mp4") else name + ".mp4", resp))
+    first: Dict[str, Tuple[float, float]] = {}
+    for name, resp in rows:                           # pred_df.loc[name == v].values[0]
+        if name not in first:
+            first[name] = vau_parse_glue(resp)
+    for name, _ in rows:
+        g = gt.get(name)
+        if g is None or g.tag_normal or (valid_only and not g.tag_valid):
+            continue
+        ps, pe = first[name]
+        iou = vau_tag_iou(g.start_time, g.end_time, ps, pe)
+        ious.append(iou)
+        per[name] = iou
+        for t in VAU_RECALLS:
+            rec[t] += int(iou >= t)
+    require(len(ious) > 0, "evaluation_tag.py divides by the number of scored videos; got 0")
+    out = {"n": len(ious), "miou": float(_vau_round(np.array(ious).mean()))}
+    for t in VAU_RECALLS:
+        out[f"r@{t}"] = float(_vau_round(rec[t] / len(ious)))
+    out["_per_item"] = per
+    return out
+
+
+def vau_tag_scorable(gt: Dict[str, VAUGroundTruth], valid_only: bool = False) -> bool:
+    return any(not g.tag_normal and (g.tag_valid or not valid_only) for g in gt.values())
+
+
+def _vau_tag_empty() -> Dict[str, Any]:
+    """No scorable video (the official script would divide by zero)."""
+    return {"n": 0, "miou": float("nan"), **{f"r@{t}": float("nan") for t in VAU_RECALLS},
+            "_per_item": {}}
+
+
+# pandas.read_csv default na_values: these cells are NaN in the official scripts.
+_VAU_PANDAS_NA = {"", "#N/A", "#N/A N/A", "#NA", "-1.#IND", "-1.#QNAN", "-NaN", "-nan", "1.#IND",
+                  "1.#QNAN", "<NA>", "N/A", "NA", "NULL", "NaN", "None", "n/a", "nan", "null"}
+
+
+def vau_official_qa(gt_rows: Sequence[VAUGroundTruth], pred: Dict[str, Optional[str]]
+                    ) -> Dict[str, Any]:
+    """evaluate_qa.py: accuracy over non-NaN predictions (case-insensitive string
+    equality with the verbatim Correct Option). Cells pandas reads as NaN are
+    NaN here too."""
+    correct = valid = 0
+    per: Dict[str, int] = {}
+    for g in gt_rows:
+        p = pred.get(str(g.video_name))
+        if p is None or (isinstance(p, float) and math.isnan(p)) or (
+                isinstance(p, str) and p in _VAU_PANDAS_NA):
+            continue
+        valid += 1
+        ok = int(str(p).lower() == str(g.correct_option).lower())
+        correct += ok
+        per[g.video_name] = ok
+    return {"n_total": len(gt_rows), "n_valid": valid,
+            "accuracy": (correct / valid) * 100 if valid else 0.0, "_per_item": per}
+
+
+def _vau_option_pattern() -> "re.Pattern":
+    parts = []
+    for opt in VAU_CLASSES:
+        words = map(re.escape, re.split(r"[_\s]+", opt))
+        parts.append(r"(?:%s)" % r"[_\s]*".join(words))
+    return re.compile(r"\b(" + "|".join(parts) + r")\b", flags=re.IGNORECASE)
+
+
+_VAU_OPTION_RE = _vau_option_pattern()
+_VAU_CANON = {re.sub(r"[\s_]+", "_", o.strip().lower()): o for o in VAU_CLASSES}
+
+
+def vau_extract_options(response: str) -> List[str]:
+    """evaluation_cls.py extract_options. The <answer> text is taken as
+    BeautifulSoup(html.parser).find('answer').text would: the first <answer>
+    element up to its closing tag (or the end), tags removed, entities decoded."""
+    import html as _html
+    if "<answer>" in response:
+        m = re.search(r"<answer\b[^>]*>(.*?)(?:</answer\s*>|\Z)", response, re.S | re.I)
+        if m:
+            response = _html.unescape(re.sub(r"<[^>]*>", "", m.group(1)))
+    seen, out = set(), []
+    for m in _VAU_OPTION_RE.finditer(response):
+        c = _VAU_CANON.get(re.sub(r"[\s_]+", "_", m.group(1).strip().lower()))
+        if c and c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def vau_official_cls(gt_rows: Sequence[VAUGroundTruth], pred_rows: Sequence[Tuple[str, str]]
+                     ) -> Dict[str, Any]:
+    """CLSEvaluator.evaluate: the first extracted option is the prediction; the
+    denominator is every GT row (a missing or option-free answer is wrong)."""
+    first = {}
+    for name, resp in vau_dedup_preds(pred_rows):
+        first[name] = vau_extract_options(str(resp))
+    binary, cls, valid = [], [], 0
+    per: Dict[str, Tuple[int, int]] = {}
+    for g in gt_rows:
+        name = str(g.video_name)
+        if ".mp4" not in name:
+            name = f"{name}.mp4"
+        pred = first.get(name, [])
+        if len(pred) == 0:
+            binary.append(False)
+            cls.append(False)
+        else:
+            valid += 1
+            p, gc = pred[0].lower(), str(g.anomaly_class).lower()
+            binary.append(p == gc if gc == "normal" else p != "normal")
+            cls.append(p == gc)
+        per[g.video_name] = (int(binary[-1]), int(cls[-1]))
+    return {"n_total": len(gt_rows), "n_valid": valid,
+            "binary_accuracy": float(_vau_round(np.mean(np.array(binary)))),
+            "cls_accuracy": float(_vau_round(np.mean(np.array(cls)))), "_per_item": per}
+
+
+def vau_parse_judge(content: str) -> Optional[Dict[str, Any]]:
+    """generate_answer of evaluate_reasoning_deepseek.py: the ```json fenced block.
+    The original crashes when it is missing or invalid; here that is None (the
+    caller retries) and so are non-numeric scores. Missing keys count 0 (as
+    answer.get(key, 0))."""
+    m = re.search(r"```json\n(.*?)\n```", content or "", re.DOTALL)
+    if not m:
+        return None
+    try:
+        d = json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(d, dict):
+        return None
+    for k in VAU_EVAL_KEYS:
+        v = d.get(k, 0)
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return None
+    return d
+
+
+def vau_official_reasoning(gt: Dict[str, VAUGroundTruth],
+                           rows: Sequence[Tuple[str, str, str]],
+                           scores: Dict[str, Optional[Dict[str, Any]]]) -> Dict[str, Any]:
+    """main() of evaluate_reasoning_deepseek.py: mean of every key over the videos
+    that were judged (GT and prediction texts all non-empty). scores[name] is the
+    parsed judge reply; None = could not be judged."""
+    tot = {k: 0.0 for k in VAU_EVAL_KEYS}
+    count, skipped, failed = 0, 0, 0
+    per: Dict[str, Dict[str, float]] = {}
+    for name, desc, ana in rows:
+        g = gt.get(name)
+        if not (g and g.description and g.reasoning and desc and ana):
+            skipped += 1
+            continue
+        s = scores.get(name)
+        if s is None:
+            failed += 1
+            continue
+        count += 1
+        per[name] = {k: float(s.get(k, 0)) for k in VAU_EVAL_KEYS}
+        for k in VAU_EVAL_KEYS:
+            tot[k] += per[name][k]
+    out: Dict[str, Any] = {"n_judged": count, "n_skipped_incomplete": skipped,
+                           "n_judge_failures": failed}
+    for k in VAU_EVAL_KEYS:
+        out[k] = tot[k] / count if count > 0 else 0
+    out["_per_item"] = per
+    return out
+
+
+class VAUJudge:
+    """VAU-Eval judge: OpenAI-compatible chat API (official: deepseek-chat at
+    https://api.deepseek.com, no sampling arguments). Replies are cached per
+    (model, temperature, prompt); a reply without a valid ```json block is
+    re-requested up to `retries` times (the original script would crash)."""
+
+    def __init__(self, vs: VAUSettings, cache_dir: str,
+                 fn: Optional[Callable[[str, str], str]] = None):
+        self.vs, self.cache_dir, self.fn = vs, cache_dir, fn
+        self.calls = self.retries_used = self.failures = 0
+        require(vs.judge_backend in ("openai", "mock"), "--vau_judge_backend must be openai|mock")
+        if vs.judge_backend == "mock":
+            require(fn is not None, "mock judge needs a reply function")
+        else:
+            key = vs.judge_api_key or os.environ.get("DEEPSEEK_API_KEY", "")
+            require(bool(key), "VAU-Eval needs the judge API key: pass --vau_judge_api_key or set "
+                               "DEEPSEEK_API_KEY")
+            self.api_key = key
+
+    def _chat(self, prompt: str) -> str:
+        if self.vs.judge_backend == "mock":
+            return self.fn(VAU_JUDGE_SYSTEM, prompt)
+        import requests
+        payload: Dict[str, Any] = {"model": self.vs.judge_model,
+                                   "messages": [{"role": "system", "content": VAU_JUDGE_SYSTEM},
+                                                {"role": "user", "content": prompt}]}
+        if self.vs.judge_temperature is not None:
+            payload["temperature"] = float(self.vs.judge_temperature)
+        last = None
+        for a in range(4):
+            try:
+                r = requests.post(f"{self.vs.judge_api_base.rstrip('/')}/chat/completions",
+                                  headers={"Authorization": f"Bearer {self.api_key}",
+                                           "Content-Type": "application/json"},
+                                  json=payload, timeout=300)
+                r.raise_for_status()
+                return str(r.json()["choices"][0]["message"]["content"] or "")
+            except Exception as e:  # pragma: no cover - network
+                last = e
+                time.sleep(2 ** a)
+        raise RuntimeError(f"VAU-Eval judge request failed 4 times ({last}); nothing was scored")
+
+    def score(self, gt_description: str, gt_analysis: str, description: str,
+              analysis: str) -> Optional[Dict[str, Any]]:
+        prompt = vau_judge_prompt(gt_description, gt_analysis, description, analysis)
+        key = sha1(json.dumps([self.vs.judge_backend, self.vs.judge_model,
+                               self.vs.judge_temperature, prompt]))
+        path = os.path.join(self.cache_dir, key[:2], key + ".json")
+        if self.vs.judge_backend != "mock" and os.path.exists(path):
+            return read_json(path)["parsed"]
+        for attempt in range(1 + max(0, self.vs.judge_retries)):
+            content = self._chat(prompt)
+            self.calls += 1
+            self.retries_used += int(attempt > 0)
+            parsed = vau_parse_judge(content)
+            if parsed is not None:
+                if self.vs.judge_backend != "mock":
+                    atomic_write_json(path, {"parsed": parsed, "raw": content})
+                return parsed
+        self.failures += 1
+        return None
+
+
+_VAU_PY_CHECKED: Dict[str, str] = {}
+
+
+def vau_check_official_python(python: str) -> str:
+    """The official scripts need pandas < 3: under pandas >= 3 (string dtype by
+    default) evaluation_cls.py's df.at[i, 'CLS answer'] = [options] stores a
+    string, pred[0] becomes its first CHARACTER, and every 20-way prediction is
+    scored wrong without an error."""
+    import subprocess
+    if python not in _VAU_PY_CHECKED:
+        p = subprocess.run([python, "-I", "-c", "import pandas, bs4, markdown, sklearn; "
+                                                "print(pandas.__version__)"],
+                           capture_output=True, text=True, timeout=300)
+        require(p.returncode == 0, f"{python} cannot import the official scripts' dependencies "
+                                   f"(pandas, beautifulsoup4, markdown, scikit-learn): "
+                                   f"{p.stderr[-500:]}")
+        _VAU_PY_CHECKED[python] = p.stdout.strip()
+    ver = _VAU_PY_CHECKED[python]
+    require(int(ver.split(".")[0]) < 3,
+            f"{python} has pandas {ver}; the official evaluation_cls.py silently mis-scores every "
+            f"20-way prediction under pandas >= 3. Pass --vau_repo_python with an interpreter that "
+            f"has pandas < 3 (e.g. python -m venv v && v/bin/pip install 'pandas<3' "
+            f"beautifulsoup4 markdown scikit-learn)")
+    return ver
+
+
+def vau_run_official_script(repo: str, task: str, gt_csv: str, pred_csv: str, out_dir: str,
+                            python: str = "") -> Dict[str, float]:
+    """Runs one unmodified official evaluator (python -I) and parses its report."""
+    import subprocess
+    python = python or sys.executable
+    vau_check_official_python(python)
+    script = os.path.join(repo, "src", "evaluation", VAU_OFFICIAL_SCRIPTS[task])
+    require(os.path.isfile(script), f"official evaluator not found at {script}")
+    save = os.path.join(out_dir, f"official_{task}_eval.txt")
+    p = subprocess.run([python, "-I", script, "--test_gt_path", gt_csv, "--pred_path",
+                        pred_csv, "--save_path", save], capture_output=True, text=True, timeout=1800)
+    require(p.returncode == 0, f"official {VAU_OFFICIAL_SCRIPTS[task]} failed ({p.returncode}): "
+                               f"{(p.stderr or p.stdout)[-2000:]}")
+    with open(save, encoding="utf-8") as f:
+        txt = f.read()
+    pats = {"qa": {"accuracy": r"Accuracy \(based on valid predictions\): ([-\d.e]+)%",
+                   "n_valid": r"Valid Predictions: (\d+)"},
+            "tag": {"miou": r"Mean IoU: ([-\d.e]+)%", "r@0.3": r"Recall @0\.3: ([-\d.e]+)%",
+                    "r@0.5": r"Recall @0\.5: ([-\d.e]+)%", "r@0.7": r"Recall @0\.7: ([-\d.e]+)%",
+                    "n": r"Valid Predictions: (\d+)"},
+            "cls": {"binary_accuracy": r"Binary accuracy: ([-\d.e]+)%",
+                    "cls_accuracy": r"CLS accuracy: ([-\d.e]+)%", "n_valid": r"Valid Predictions: (\d+)"}}
+    out = {}
+    for k, pat in pats[task].items():
+        m = re.search(pat, txt)
+        require(m is not None, f"cannot parse {k} from {save}: {txt[:500]}")
+        out[k] = float(m.group(1))
+    return out
+
+
+# -----------------------------------------------------------------------------
+# Evaluation of runs: official CSVs, official metrics, diagnostics
+# -----------------------------------------------------------------------------
+
+def vau_prediction_rows(raw_items: Sequence[Dict[str, Any]], tasks: Sequence[str]
+                        ) -> Dict[str, List[List[str]]]:
+    """Official prediction CSV rows. Failures are answered, never left blank."""
+    out: Dict[str, List[List[str]]] = {t: [] for t in tasks}
+    for r in raw_items:
+        n = r["video_name"]
+        if "qa" in out:
+            out["qa"].append([n, r.get("qa_pred") or VAU_MISSING_QA])
+        if "tag" in out:
+            ps, pe = r.get("pred_start"), r.get("pred_end")
+            lab = "Normal" if r.get("cls_pred") == "Normal" else "Anomaly"
+            glue = (f"[{ps:.6f}, {pe:.6f}]" if ps is not None and pe is not None else "[0.0, 0.0]")
+            out["tag"].append([n, f"<answer>{lab}</answer><glue>{glue}</glue>"])
+        if "cls" in out:
+            out["cls"].append([n, f"<answer>{r['cls_pred']}</answer>" if r.get("cls_pred")
+                               else "<answer>none</answer>"])
+        if "reason" in out:
+            out["reason"].append([n, r.get("description") or "", r.get("analysis") or ""])
+    return out
+
+
+def vau_evaluate_predictions(ds: VAUDataset, names: Sequence[str],
+                             rows: Dict[str, List[List[str]]], out_dir: str, vs: VAUSettings,
+                             judge: Optional[VAUJudge]) -> Dict[str, Any]:
+    """Score official-format prediction rows against the GT rows of `names`
+    (a partial run is scored on its own videos only: evaluation_cls.py counts
+    every GT row in its denominator)."""
+    os.makedirs(out_dir, exist_ok=True)
+    gt_rows = [ds.gt[n] for n in names]
+    gt_csv = os.path.join(out_dir, "gt_selected.csv")
+    vau_write_csv(gt_csv, VAU_COLUMNS, [[ds.raw_rows[n][c] for c in VAU_COLUMNS] for n in names])
+    paths = {}
+    for t, rr in rows.items():
+        paths[t] = os.path.join(out_dir, f"{t}_predictions.csv")
+        vau_write_csv(paths[t], VAU_PRED_HEADERS[t], rr)
+    m: Dict[str, Any] = {}
+    if "qa" in rows:
+        m["qa"] = vau_official_qa(gt_rows, {r[0]: r[1] for r in vau_dedup_preds(rows["qa"])})
+    if "tag" in rows:
+        sel = {n: ds.gt[n] for n in names}
+        tr = [(r[0], r[1]) for r in rows["tag"]]
+        m["tag"] = vau_official_tag(sel, tr) if vau_tag_scorable(sel) else _vau_tag_empty()
+        m["tag_valid_gt"] = (vau_official_tag(sel, tr, valid_only=True)
+                             if vau_tag_scorable(sel, True) else _vau_tag_empty())
+    if "cls" in rows:
+        m["cls"] = vau_official_cls(gt_rows, [(r[0], r[1]) for r in rows["cls"]])
+    if "reason" in rows and judge is not None:
+        scores = {}
+        for n, desc, ana in rows["reason"]:
+            g = ds.gt.get(n)
+            if g and g.description and g.reasoning and desc and ana:
+                scores[n] = judge.score(g.description, g.reasoning, desc, ana)
+        m["reason"] = vau_official_reasoning(ds.gt, [tuple(r) for r in rows["reason"]], scores)
+        atomic_write_json(os.path.join(out_dir, "vau_eval_scores.json"),
+                          [{"video_name": n, "evaluation": s} for n, s in scores.items()])
+    parity = None
+    if vs.official_repo:
+        parity = {}
+        for t in ("qa", "tag", "cls"):
+            if t not in rows or (t == "tag" and m["tag"]["n"] == 0):
+                continue
+            off = vau_run_official_script(vs.official_repo, t, gt_csv, paths[t], out_dir,
+                                          vs.official_python)
+            mine = {k: float(v) for k, v in m[t].items() if k in off}
+
+            def same(k: str) -> bool:
+                if k not in mine:
+                    return False
+                if t == "qa" and k == "accuracy":           # printed with :.2f
+                    return f"{mine[k]:.2f}" == f"{off[k]:.2f}"
+                return abs(mine[k] - off[k]) <= 1e-9
+            diff = {k: (mine.get(k), off[k]) for k in off if not same(k)}
+            require(not diff, f"port disagrees with the official {VAU_OFFICIAL_SCRIPTS[t]} on "
+                              f"{paths[t]}: {diff}")
+            parity[t] = {"script": VAU_OFFICIAL_SCRIPTS[t], "identical": True, "official": off,
+                         "pandas": _VAU_PY_CHECKED.get(vs.official_python or sys.executable)}
+    return {"metrics": m, "official_script_parity": parity, "prediction_csvs": paths,
+            "gt_csv": gt_csv}
+
+
+def vau_diagnostics(ds: VAUDataset, items: Sequence[Dict[str, Any]], m: Dict[str, Any]
+                    ) -> Dict[str, Any]:
+    """NOT official: audited QA accuracy (leading letter of the Correct Option,
+    unanswerable '-1' rows removed), CLS without '-1' rows, run health."""
+    status = defaultdict(int)
+    for r in items:
+        status[r["status"]] += 1
+    calls = sum(int(r.get("calls", 0)) for r in items)
+    d: Dict[str, Any] = {
+        "status_counts": dict(status), "calls_per_video": calls / max(1, len(items)),
+        "logprob_truncation_rate": sum(int(r.get("logprob_truncations", 0)) for r in items)
+        / max(1, calls),
+        "monotonicity_violations": sum(int(r.get("monotonicity_violations", 0)) for r in items),
+        "frame_conflicts": sum(int(r.get("frame_conflicts", 0)) for r in items),
+        "tag_profile_source": _vau_counts([r.get("tag_profile_source") for r in items]),
+        "mean_bma_mass_kept_cls": float(np.mean([r["cls_mass_kept"] for r in items
+                                                 if "cls_mass_kept" in r] or [float("nan")]))}
+    if "qa" in m:
+        ok = [(int(str(r.get("qa_pred")) == ds.gt[r["video_name"]].correct_option.strip()[:1].upper()))
+              for r in items if ds.gt[r["video_name"]].correct_option != "-1"]
+        d["qa_audited_accuracy"] = 100.0 * float(np.mean(ok)) if ok else None
+        d["qa_audited_n"] = len(ok)
+        d["mean_bma_mass_kept_qa"] = float(np.mean([r["qa_mass_kept"] for r in items
+                                                    if "qa_mass_kept" in r] or [float("nan")]))
+    if "cls" in m:
+        per = m["cls"]["_per_item"]
+        keep = [n for n in per if ds.gt[n].anomaly_class != "-1"]
+        d["cls_accuracy_without_-1_rows"] = (100.0 * float(np.mean([per[n][1] for n in keep]))
+                                             if keep else None)
+        d["cls_binary_accuracy_without_-1_rows"] = (100.0 * float(np.mean([per[n][0] for n in keep]))
+                                                    if keep else None)
+        d["cls_prediction_distribution"] = _vau_counts([r.get("cls_pred") for r in items])
+    return d
+
+
+def vau_evaluate_run(vs: VAUSettings, ds: VAUDataset, raw_path: str,
+                     judge: Optional[VAUJudge] = None) -> Dict[str, Any]:
+    raw = read_json(raw_path)
+    require(raw.get("complete", False), f"{raw_path} is an unfinished run")
+    require(raw.get("inputs_fingerprint") == ds.inputs_fingerprint,
+            f"{raw_path} was produced from a different annotation version")
+    items = raw["items"]
+    names = [r["video_name"] for r in items]
+    require(len(set(names)) == len(names) and set(names) <= set(ds.gt),
+            f"{raw_path}: video names are duplicated or unknown to the annotation file")
+    tasks = [t for t in VAU_TASKS if t in raw.get("tasks", VAU_TASKS)]
+    run_dir = os.path.dirname(raw_path)
+    j0 = (judge.calls, judge.retries_used, judge.failures) if judge is not None else None
+    ev = vau_evaluate_predictions(ds, names, vau_prediction_rows(items, tasks),
+                                  os.path.join(run_dir, "official_eval"), vs, judge)
+    diag = vau_diagnostics(ds, items, ev["metrics"])
+    if judge is not None:
+        diag["judge"] = {"model": vs.judge_model, "temperature": vs.judge_temperature,
+                         "calls": judge.calls - j0[0], "retries_used": judge.retries_used - j0[1],
+                         "failures": judge.failures - j0[2]}
+    res = {"subset": ds.subset, "backbone": raw["backbone"], "model": raw["model"],
+           "rule": raw["rule"], "partial": raw["partial"], "limit": raw["limit"], "tasks": tasks,
+           "official_metrics": {k: {kk: vv for kk, vv in v.items() if not kk.startswith("_")}
+                                for k, v in ev["metrics"].items()},
+           "official_script_parity": ev["official_script_parity"],
+           "diagnostics_not_official": diag, "raw_outputs": raw_path,
+           "prediction_csvs": ev["prediction_csvs"]}
+    atomic_write_json(os.path.join(run_dir, "metrics.json"), res)
+    res["_items"] = items
+    res["_metrics"] = ev["metrics"]
+    return res
+
+
+# -----------------------------------------------------------------------------
+# Summary tables (official metrics first; diagnostics clearly labelled)
+# -----------------------------------------------------------------------------
+
+def vau_selection_tag(subsets: Sequence[str], backbones: Sequence[str]) -> str:
+    st = "all" if set(subsets) == set(VAU_SUBSETS) else "+".join(subsets)
+    bt = "all" if set(backbones) == set(VAU_BACKBONES) else "+".join(backbones)
+    return f"{st}__{bt}"
+
+
+_VAU_ECHO = [True]
+VAU_MAIN_HEADER = ("Model | QA Acc. | TAG mIoU | R@0.3 | R@0.5 | R@0.7 | CLS Bin. Acc. | "
+                   "CLS Acc.")
+
+
+def vau_write_summary(cfg: Config, vs: VAUSettings, datasets: Dict[str, VAUDataset],
+                      results: Dict[str, Dict[str, Dict[str, Any]]],
+                      backbones: Sequence[str]) -> str:
+    sp = os.path.join(vau_paths(vs)["summary"], vau_selection_tag(vs.subsets, backbones))
+    os.makedirs(sp, exist_ok=True)
+    status = (f"PARTIAL RUN (--limit {vs.limit}): the first {vs.limit} videos of each test set; "
+              f"NOT benchmark results" if vs.partial else "FULL RUN (all test videos)")
+    L: List[str] = [
+        "# HOVER v10 on VAU-Bench (HOVER-VAU)", "", f"**Status: {status}**", "",
+        "- Method: E (calibrated generic anomaly profile) -> H (20-way class posterior by Bayesian "
+        "model averaging over the evidence window) -> V (class-conditioned profile) -> S (K = 1) "
+        "+ masked-frame refinement -> QA (same BMA) -> R (official prompts on a storyboard of the "
+        "localised segment).",
+        f"- Rule fixed before any VAU-Bench result ({'predeclared' if vs.predeclared() else '**NOT the predeclared rule**'}): "
+        + ", ".join(f"{k} = {v}" for k, v in vs.rule().items()) + "; nothing was fitted on VAU-Bench.",
+        "- Metrics: exact ports of the official VAU-R1 evaluators (src/evaluation/evaluate_qa.py, "
+        "evaluation_tag.py, evaluation_cls.py, evaluate_reasoning_deepseek.py)"
+        + (", cross-checked against the unmodified scripts on every prediction file"
+           if vs.official_repo else "") + ". All accuracies, mIoU and recalls are percentages.",
+        "- TAG (official script) scores every video whose GT is not (0, 0), including (-1, -1) rows "
+        "that can only score IoU 0; 'TAG, valid GT' drops those rows (the denominators of "
+        "published VAU-Bench TAG numbers).",
+        "- No aggregation across test sets. Compare with published numbers only for the same "
+        "test set, metric and protocol, and label them as published.", ""]
+    rows_csv: List[Dict[str, Any]] = []
+    out_json: Dict[str, Any] = {"status": status, "partial": vs.partial, "rule": vs.rule(),
+                                "predeclared": vs.predeclared(), "subsets": {}}
+    for s in vs.subsets:
+        res, ds = results.get(s, {}), datasets[s]
+        L += [f"## {VAU_DISPLAY[s]}", ""]
+        if not res:
+            L += ["No completed run for this test set.", ""]
+            continue
+        by = {k: {r["video_name"]: r for r in v["_items"]} for k, v in res.items()}
+        common = [q.video_name for q in ds.items if all(q.video_name in by[k] for k in by)]
+        same = all(len(by[k]) == len(common) for k in by)
+        L += [f"N = {len(common)} videos" + ("" if same else " (INTERSECTION of the backbones' "
+                                                             "video sets)") + ".", ""]
+        sub: Dict[str, Any] = {}
+        for k, v in res.items():
+            tasks = v["tasks"]
+            ev = vau_evaluate_predictions(ds, common, vau_prediction_rows(
+                [by[k][n] for n in common], tasks), os.path.join(sp, "eval", s, k),
+                VAUSettings(**{**vs.__dict__, "official_repo": ""}), None)
+            mm = ev["metrics"]
+            if "reason" in v["_metrics"]:
+                rs = v["_metrics"]["reason"]["_per_item"]
+                cnt = [n for n in common if n in rs]
+                mm["reason"] = {**{kk: (float(np.mean([rs[n][kk] for n in cnt])) if cnt else 0)
+                                   for kk in VAU_EVAL_KEYS}, "n_judged": len(cnt), "_per_item": rs}
+            sub[k] = {"m": mm, "items": [by[k][n] for n in common],
+                      "diag": v["diagnostics_not_official"]}
+
+        def f(x: Optional[float], nd: int = 2) -> str:
+            return _ual_fmt(x, nd)
+        L += [VAU_MAIN_HEADER, " | ".join(["---"] * 8)]
+        for k in VAU_BACKBONES:
+            if k not in sub:
+                continue
+            mm = sub[k]["m"]
+            qa, tg, cl = mm.get("qa"), mm.get("tag"), mm.get("cls")
+            L.append(" | ".join([VAU_BACKBONES[k][0], f(qa["accuracy"]) if qa else "n/a"]
+                                + ([f(tg["miou"])] + [f(tg[f"r@{t}"]) for t in VAU_RECALLS]
+                                   if tg else ["n/a"] * 4)
+                                + ([f(cl["binary_accuracy"]), f(cl["cls_accuracy"])] if cl
+                                   else ["n/a"] * 2)))
+        L += ["", "TAG, valid GT (rows with a (-1, -1) interval removed; same metric code):", "",
+              "Model | N | mIoU | R@0.3 | R@0.5 | R@0.7", "--- | --- | --- | --- | --- | ---"]
+        for k in VAU_BACKBONES:
+            if k in sub and "tag_valid_gt" in sub[k]["m"]:
+                t = sub[k]["m"]["tag_valid_gt"]
+                L.append(" | ".join([VAU_BACKBONES[k][0], str(t["n"]), f(t["miou"])]
+                                    + [f(t[f"r@{x}"]) for x in VAU_RECALLS]))
+        if any("reason" in sub[k]["m"] for k in sub):
+            L += ["", f"VAU-Eval (judge {vs.judge_model}; mean over judged videos; each 0-10, "
+                      "Total 0-50 as returned by the judge):", "",
+                  "Model | N judged | " + " | ".join(VAU_EVAL_SHORT[x] for x in VAU_EVAL_KEYS),
+                  " | ".join(["---"] * 8)]
+            for k in VAU_BACKBONES:
+                if k in sub and "reason" in sub[k]["m"]:
+                    r = sub[k]["m"]["reason"]
+                    L.append(" | ".join([VAU_BACKBONES[k][0], str(r["n_judged"])]
+                                        + [f(r[x]) for x in VAU_EVAL_KEYS]))
+        # references (no model)
+        g = {n: ds.gt[n] for n in common}
+        ref_items = next(iter(sub.values()))["items"]
+        refs = {"qa": vau_official_qa(list(g.values()), {n: "A" for n in common}),
+                "cls": vau_official_cls(list(g.values()), [(n, "<answer>Normal</answer>")
+                                                           for n in common])}
+        whole = [(r["video_name"], f"<glue>[0.0, {r['decoded_duration']:.6f}]</glue>"
+                  if r.get("decoded_duration") else "<glue>[0.0, 0.0]</glue>") for r in ref_items]
+        refs["tag"] = vau_official_tag(g, whole)
+        L += ["", "References, NOT models (same evaluators): 'always A' for QA, the whole video "
+                  "[0, decoded duration] for TAG, 'always Normal' for CLS:", "",
+              VAU_MAIN_HEADER, " | ".join(["---"] * 8),
+              " | ".join(["Trivial references", f(refs["qa"]["accuracy"]), f(refs["tag"]["miou"])]
+                         + [f(refs["tag"][f"r@{t}"]) for t in VAU_RECALLS]
+                         + [f(refs["cls"]["binary_accuracy"]), f(refs["cls"]["cls_accuracy"])]), ""]
+        # uncertainty and paired tests (NOT official)
+        L += [f"Diagnostics (NOT official; 95% bootstrap CIs over videos, B = {cfg.n_bootstrap}):",
+              "", "Model | calls/video | letters outside top-logprobs | QA audited | CI QA | "
+                  "CI TAG mIoU | CI CLS Acc.", " | ".join(["---"] * 7)]
+        per_metric: Dict[str, Dict[str, List[float]]] = defaultdict(dict)
+        for k in VAU_BACKBONES:
+            if k not in sub:
+                continue
+            mm, d = sub[k]["m"], sub[k]["diag"]
+            cis = {}
+            if "qa" in mm:
+                per_metric["QA"][k] = [100.0 * mm["qa"]["_per_item"].get(n, 0) for n in common]
+            if "tag" in mm:
+                per_metric["TAG IoU"][k] = [100.0 * mm["tag"]["_per_item"][n] for n in common
+                                            if n in mm["tag"]["_per_item"]]
+            if "cls" in mm:
+                per_metric["CLS"][k] = [100.0 * mm["cls"]["_per_item"][n][1] for n in common]
+            for name_, vals in (("QA", per_metric["QA"].get(k)), ("TAG IoU", per_metric["TAG IoU"].get(k)),
+                                ("CLS", per_metric["CLS"].get(k))):
+                cis[name_] = (ual_cluster_bootstrap_ci(vals, list(range(len(vals))), cfg.n_bootstrap,
+                                                       cfg.seed) if vals else (float("nan"),) * 2)
+            sub[k]["ci95"] = cis
+            ci = lambda t: f"[{f(cis[t][0])}, {f(cis[t][1])}]"
+            L.append(" | ".join([VAU_BACKBONES[k][0], f(d["calls_per_video"], 1),
+                                 f"{100 * d['logprob_truncation_rate']:.1f}%",
+                                 f(d.get("qa_audited_accuracy")), ci("QA"), ci("TAG IoU"), ci("CLS")]))
+        keys = [k for k in VAU_BACKBONES if k in sub]
+        pairs = [(x, y) for i, x in enumerate(keys) for y in keys[i + 1:]]
+        tests: Dict[str, Any] = {}
+        if pairs:
+            for metric, vals in per_metric.items():
+                pv = {}
+                for x, y in pairs:
+                    if x in vals and y in vals and len(vals[x]) == len(vals[y]) and vals[x]:
+                        t = ual_paired_signflip(vals[x], vals[y], list(range(len(vals[x]))),
+                                                cfg.n_permutations, cfg.seed)
+                        tests[f"{x} vs {y}|{metric}"] = t
+                        pv[f"{x} vs {y}|{metric}"] = t["p"]
+                for kk, hv in holm_bonferroni(pv).items():
+                    tests[kk]["holm_reject_0.05"] = hv["reject"]
+            L += ["", "Paired backbone comparisons (NOT official; sign-flip randomisation test over "
+                      f"videos, B = {cfg.n_permutations}, Holm-corrected per metric):", "",
+                  "Comparison | metric | Δ (points) | p | Holm reject", "--- | --- | --- | --- | ---"]
+            for kk, t in tests.items():
+                pair, metric = kk.split("|")
+                x, y = pair.split(" vs ")
+                L.append(f"{VAU_BACKBONES[x][0]} vs {VAU_BACKBONES[y][0]} | {metric} | "
+                         f"{t['delta']:+.2f} | {t['p']:.4f} | {t['holm_reject_0.05']}")
+        L.append("")
+        out_json["subsets"][s] = {
+            "n_videos": len(common), "same_video_set_for_all_backbones": same,
+            "official": {k: {t: {kk: vv for kk, vv in v_.items() if not kk.startswith("_")}
+                             for t, v_ in v["m"].items()} for k, v in sub.items()},
+            "diagnostics_not_official": {k: {**v["diag"], "ci95": v.get("ci95")}
+                                         for k, v in sub.items()},
+            "references": {t: {kk: vv for kk, vv in v_.items() if not kk.startswith("_")}
+                           for t, v_ in refs.items()},
+            "paired_tests": tests, "annotation_audit": vau_annotation_audit(ds),
+            "annotation_sha256": ds.annotation_sha256, "inputs_fingerprint": ds.inputs_fingerprint}
+        for k, v in sub.items():
+            mm = v["m"]
+            row = {"test_set": VAU_DISPLAY[s], "model": VAU_BACKBONES[k][0],
+                   "hf_id": VAU_BACKBONES[k][1], "partial": vs.partial, "n_videos": len(common)}
+            if "qa" in mm:
+                row["qa_acc"] = mm["qa"]["accuracy"]
+            for t in ("tag", "tag_valid_gt"):
+                if t in mm:
+                    row[f"{t}_n"] = mm[t]["n"]
+                    row[f"{t}_miou"] = mm[t]["miou"]
+                    for x in VAU_RECALLS:
+                        row[f"{t}_r@{x}"] = mm[t][f"r@{x}"]
+            if "cls" in mm:
+                row["cls_binary_acc"] = mm["cls"]["binary_accuracy"]
+                row["cls_acc"] = mm["cls"]["cls_accuracy"]
+            if "reason" in mm:
+                for x in VAU_EVAL_KEYS:
+                    row[f"vau_eval_{VAU_EVAL_SHORT[x]}"] = mm["reason"][x]
+            rows_csv.append(row)
+    md = os.path.join(sp, "results.md")
+    with open(md, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(L) + "\n")
+    atomic_write_json(os.path.join(sp, "results.json"), out_json)
+    if rows_csv:
+        cols = list(dict.fromkeys(c for r in rows_csv for c in r))
+        vau_write_csv(os.path.join(sp, "results.csv"), cols,
+                      [[r.get(c, "") for c in cols] for r in rows_csv])
+    if _VAU_ECHO[0]:
+        print("\n".join(L))
+    LOG.info("wrote %s (+ results.csv, results.json)", md)
+    return md
+
+
+# -----------------------------------------------------------------------------
+# Commands
+# -----------------------------------------------------------------------------
+
+def vau_banner(cfg: Config, vs: VAUSettings, backbones: Sequence[str],
+               datasets: Dict[str, VAUDataset], items: Dict[str, List[VAUItem]], phase: str) -> None:
+    LOG.info("=" * 96)
+    LOG.info("HOVER v%s | VAU-Bench | %s | %s", VERSION, phase, VAU_ADAPTER_VERSION)
+    LOG.info("test sets: %s", ", ".join(f"{VAU_DISPLAY[s]} ({len(items[s])} of "
+                                        f"{len(datasets[s].items)} videos)" for s in vs.subsets))
+    for s in vs.subsets:
+        LOG.info("  %s annotations: %s (sha256 %s, source %s)", VAU_DISPLAY[s],
+                 datasets[s].annotation_path, datasets[s].annotation_sha256[:12], datasets[s].source)
+        LOG.info("  %s video dirs: %s", VAU_DISPLAY[s], datasets[s].video_dirs)
+    for k in backbones:
+        LOG.info("backbone %s -> %s (backend %s%s)", k, VAU_BACKBONES[k][1], cfg.backend,
+                 f", api {vs.api_bases.get(k, cfg.api_base)}" if cfg.backend == "openai" else "")
+    LOG.info("tasks: %s | rule (%s): %s", ",".join(vs.tasks),
+             "predeclared" if vs.predeclared() else "NOT predeclared", vs.rule())
+    LOG.info("output: %s", vau_paths(vs)["base"])
+    if vs.partial:
+        LOG.info("PARTIAL RUN: --limit %d; outputs go to '%s' and are NOT benchmark results",
+                 vs.limit, vs.run_tag)
+    LOG.info("=" * 96)
+
+
+def cmd_inspect_vau(cfg: Config, vs: VAUSettings) -> Dict[str, Any]:
+    """Schema and protocol audit without any VLM: sources, hashes, the annotation
+    defects that change the official numbers, media availability and the GT
+    intervals checked against container durations when videos are present."""
+    report: Dict[str, Any] = {}
+    for s in vs.subsets:
+        ds = vau_load_dataset(vs, s)
+        a = {"annotation_path": ds.annotation_path, "annotation_sha256": ds.annotation_sha256,
+             "inputs_fingerprint": ds.inputs_fingerprint, "source": ds.source,
+             **vau_annotation_audit(ds), "video_dirs": ds.video_dirs,
+             "n_videos_present": sum(1 for p in ds.video_paths.values() if p),
+             "missing_examples": sorted(n for n, p in ds.video_paths.items() if not p)[:5]}
+        dur = {n: ual_header_duration(p) for n, p in ds.video_paths.items() if p}
+        ex = [(n, ds.gt[n].end_time, d) for n, d in dur.items() if d and ds.gt[n].tag_valid]
+        if ex:
+            a["checked_against_video_durations"] = len(ex)
+            a["gt_end_beyond_duration_by_>1s"] = sum(1 for _, e, d in ex if e > d + 1.0)
+        if any(dur.values()):
+            a["total_video_hours_present"] = sum(d for d in dur.values() if d) / 3600.0
+            # Upper bound per video and backbone: two profiles of T windows + their
+            # content-free probes, 2 x 8 BMA scores, 2 x (3 + 1) bisection steps,
+            # 2 reasoning turns; T = ceil(duration * fps / window_size).
+            a["vlm_calls_upper_bound_per_backbone"] = int(sum(
+                2 * math.ceil(d * vs.fps / cfg.window_size) + 2 + 2 * vs.bma_max_windows + 8 + 2
+                for d in dur.values() if d))
+        report[s] = a
+        print(f"\n== {VAU_DISPLAY[s]} audit ==")
+        print(json.dumps(_jsonable(a), indent=2))
+    out = os.path.join(vau_paths(vs)["inspect"], "audit.json")
+    atomic_write_json(out, report)
+    LOG.info("wrote %s", out)
+    return report
+
+
+def vau_make_judge(vs: VAUSettings, fn: Optional[Callable] = None) -> Optional[VAUJudge]:
+    if not vs.judge:
+        return None
+    return VAUJudge(vs, vau_paths(vs)["judge_cache"], fn)
+
+
+def cmd_run_vau(cfg: Config, vs: VAUSettings, backbones: Sequence[str],
+                oracle: Optional[Callable] = None, model_override: str = "",
+                judge_fn: Optional[Callable] = None) -> str:
+    """Load and validate every test set, check every backbone (and the judge),
+    then infer and evaluate. Nothing expensive starts before all checks pass."""
+    datasets = {s: vau_load_dataset(vs, s) for s in vs.subsets}
+    items = {s: vau_select_items(ds, vs.limit) for s, ds in datasets.items()}
+    for s, ds in datasets.items():
+        vau_check_media(ds, items[s], vs.allow_missing_videos)
+    judge = vau_make_judge(vs, judge_fn)
+    bcfg = {k: vau_backbone_config(cfg, k, vs, model_override) for k in backbones}
+    pre = {k: vau_preflight_backbone(c) for k, c in bcfg.items()}
+    vau_banner(cfg, vs, backbones, datasets, items, "inference + official evaluation")
+    memo: Dict = {}
+    runs: Dict[str, Dict[str, str]] = defaultdict(dict)
+    for k in backbones:
+        c, vlm = bcfg[k], None
+        for s in vs.subsets:
+            ds = datasets[s]
+            ns, cache = vau_cache_namespace(c, ds), vau_paths(vs, s, k)["cache"]
+            if vlm is None:
+                vlm = make_vau_vlm(c, cache, ns, oracle)
+            else:
+                _vau_switch_subset(vlm, cache, ns)
+            smoke = None
+            first = next((q for q in items[s] if ds.video_paths.get(q.video_name)), None)
+            if first is not None:
+                try:
+                    w0, _ = vau_prepare_video(c, vs, ds, first.video_name, memo)
+                except Exception as e:
+                    LOG.warning("smoke test skipped: %s does not decode (%s)", first.video_name, e)
+                else:
+                    smoke = vau_smoke_test(vlm, c, ds, w0, first)
+                    LOG.info("smoke test %s on %s: %s", k, VAU_DISPLAY[s], smoke)
+            runs[s][k] = vau_run_backbone(c, vs, ds, items[s], vlm, memo, pre[k], smoke)
+        del vlm
+        if c.backend == "hf":
+            try:
+                import torch
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+    results = {s: {k: vau_evaluate_run(vs, datasets[s], p, judge) for k, p in runs[s].items()}
+               for s in vs.subsets}
+    return vau_write_summary(cfg, vs, datasets, results, backbones)
+
+
+def cmd_evaluate_vau(cfg: Config, vs: VAUSettings, backbones: Sequence[str],
+                     judge_fn: Optional[Callable] = None) -> str:
+    """Re-evaluate saved runs (no VLM calls; judge calls only with --vau_judge)."""
+    datasets = {s: vau_load_dataset(vs, s) for s in vs.subsets}
+    items = {s: vau_select_items(ds, vs.limit) for s, ds in datasets.items()}
+    judge = vau_make_judge(vs, judge_fn)
+    vau_banner(cfg, vs, backbones, datasets, items, "evaluation only (no VLM calls)")
+    results: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for s in vs.subsets:
+        results[s] = {}
+        for k in backbones:
+            p = os.path.join(vau_paths(vs, s, k)["run"], "raw_outputs.json")
+            if os.path.exists(p):
+                results[s][k] = vau_evaluate_run(vs, datasets[s], p, judge)
+            else:
+                LOG.warning("no %s/%s run for %s / %s at %s", vs.rule_tag, vs.run_tag,
+                            VAU_DISPLAY[s], k, p)
+    require(any(results.values()), "no completed VAU-Bench run found; run 'run_vau' first")
+    return vau_write_summary(cfg, vs, datasets, results,
+                             [k for k in backbones if any(k in r for r in results.values())])
+
+
+def _vau_parse_kv(txt: str, allowed: Sequence[str], flag: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for part in [p.strip() for p in (txt or "").split(",") if p.strip()]:
+        require("=" in part, f"{flag} entry {part!r} is not key=value")
+        k, v = part.split("=", 1)
+        require(k.strip() in allowed, f"{flag}: unknown key {k.strip()!r}; allowed {list(allowed)}")
+        out[k.strip()] = v.strip()
+    return out
+
+
+def cmd_evaluate_vau_files(vs: VAUSettings, preds: Dict[str, str],
+                           judge_fn: Optional[Callable] = None) -> Dict[str, Any]:
+    """Score external prediction CSVs in the official schema (e.g. the official
+    Qwen inference outputs) with the same ports, on ONE test set."""
+    require(len(vs.subsets) == 1, "--vau_pred_csv scores one test set: pass --vau_dataset "
+                                  "msad|ucf|ecva")
+    ds = vau_load_dataset(vs, vs.subsets[0])
+    rows: Dict[str, List[List[str]]] = {}
+    for t, p in preds.items():
+        data = vau_read_csv(p)
+        require(data and all(c in data[0] for c in VAU_PRED_HEADERS[t]),
+                f"{p} lacks the official columns {list(VAU_PRED_HEADERS[t])}")
+        rows[t] = [[r[c] for c in VAU_PRED_HEADERS[t]] for r in data]
+    names = [q.video_name for q in ds.items]
+    out_dir = os.path.join(vau_paths(vs)["base"], "external_eval", vs.subsets[0],
+                           sha1(json.dumps(preds, sort_keys=True))[:10])
+    ev = vau_evaluate_predictions(ds, names, rows, out_dir, vs, vau_make_judge(vs, judge_fn))
+    m = {k: {kk: vv for kk, vv in v.items() if not kk.startswith("_")}
+         for k, v in ev["metrics"].items()}
+    print(json.dumps({"test_set": VAU_DISPLAY[ds.subset], "files": preds, "official_metrics": m,
+                      "official_script_parity": ev["official_script_parity"]}, indent=2))
+    return m
+
+
+def vau_settings_from_args(a: argparse.Namespace) -> VAUSettings:
+    require(bool(a.vau_dataset), "pass --vau_dataset {msad,ucf,ecva,all}")
+    subsets = VAU_SUBSETS if a.vau_dataset == "all" else (a.vau_dataset,)
+    tasks = tuple(t for t in VAU_TASKS if t in {x.strip() for x in a.vau_tasks.split(",")})
+    require(bool(tasks) and {x.strip() for x in a.vau_tasks.split(",") if x.strip()} <= set(VAU_TASKS),
+            f"--vau_tasks must be a comma list of {VAU_TASKS}")
+    require({"tag", "cls"} <= set(tasks), "TAG and CLS are always computed by HOVER-VAU (H feeds "
+                                          "V); --vau_tasks may drop qa and reason only")
+    vs = VAUSettings(
+        subsets=tuple(subsets), source=a.vau_source, annotations_dir=a.vau_annotations_dir or "",
+        subset_annotations={s: getattr(a, f"vau_{s}_annotations") for s in VAU_SUBSETS
+                            if getattr(a, f"vau_{s}_annotations")},
+        hf_repo=a.vau_hf_repo, hf_revision=a.vau_hf_revision or "",
+        video_root=a.vau_video_root or "",
+        subset_videos={s: getattr(a, f"vau_{s}_videos") for s in VAU_SUBSETS
+                       if getattr(a, f"vau_{s}_videos")},
+        work_root=a.vau_work_root or "", tasks=tasks,
+        fps=float(a.fps) if a.fps is not None else VAU_PREDECLARED["fps"],
+        seg_tau=float(a.vau_seg_tau), seg_penalty=float(a.vau_seg_penalty),
+        refine_mode=a.vau_refine_mode, tag_profile=a.vau_tag_profile,
+        bma_mass=float(a.vau_bma_mass), bma_max_windows=int(a.vau_bma_max_windows),
+        option_calibration=bool(a.vau_option_calibration), reason_context=a.vau_reason_context,
+        storyboard_frames=int(a.vau_storyboard_frames),
+        storyboard_context=float(a.vau_storyboard_context),
+        allow_missing_videos=bool(a.vau_allow_missing_videos),
+        api_bases=_vau_parse_kv(a.vau_api_bases, list(VAU_BACKBONES), "--vau_api_bases"),
+        limit=a.limit, official_repo=a.vau_repo or "",
+        official_python=a.vau_repo_python or "", judge=bool(a.vau_judge),
+        judge_backend=a.vau_judge_backend, judge_api_base=a.vau_judge_api_base,
+        judge_model=a.vau_judge_model, judge_api_key=a.vau_judge_api_key or "",
+        judge_temperature=a.vau_judge_temperature, judge_retries=int(a.vau_judge_retries))
+    require(vs.source in ("local", "hf"), "--vau_source must be local or hf")
+    require(vs.refine_mode in UAL_REFINE_MODES, f"--vau_refine_mode must be one of {UAL_REFINE_MODES}")
+    require(vs.tag_profile in VAU_TAG_PROFILES, f"--vau_tag_profile must be one of {VAU_TAG_PROFILES}")
+    require(vs.reason_context in VAU_REASON_CONTEXTS,
+            f"--vau_reason_context must be one of {VAU_REASON_CONTEXTS}")
+    require(math.isfinite(vs.seg_tau) and vs.seg_penalty >= 0, "invalid --vau_seg_tau/penalty")
+    require(0.0 < vs.bma_mass <= 1.0 and vs.bma_max_windows >= 1, "invalid --vau_bma_mass/max_windows")
+    require(vs.fps > 0 and vs.storyboard_frames >= 1 and vs.storyboard_context >= 0,
+            "invalid --fps / storyboard settings")
+    require(vs.limit is None or vs.limit > 0, "--limit must be positive")
+    return vs
+
+
+def main_vau(a: argparse.Namespace) -> None:
+    require(a.dataset in (None, "vau_bench"),
+            f"'{a.command}' is a VAU-Bench command; --dataset must be vau_bench (got {a.dataset})")
+    if a.command == "selftest_vau":
+        selftest_vau(a.vau_repo or "", a.vau_repo_python or "")
+        return
+    require(a.method == "HOVER", "VAU-Bench evaluates HOVER only; GliDe and vanilla are not run on "
+                                "VAU-Bench (explicit guard)")
+    bb = a.backbone
+    a.backbone = None
+    try:
+        cfg = cfg_from_args(a)
+    finally:
+        a.backbone = bb
+    vs = vau_settings_from_args(a)
+    cfg.fps = vs.fps
+    vs.work_root = vau_resolve_work_root(vs, cfg)
+    setup_logging(vau_paths(vs)["logs"], a.command)
+    set_seed(cfg.seed)
+    if a.command == "inspect_vau":
+        cmd_inspect_vau(cfg, vs)
+    elif a.command == "run_vau":
+        cmd_run_vau(cfg, vs, vau_resolve_backbones(bb), model_override=a.model or "")
+    elif a.command == "evaluate_vau":
+        if a.vau_pred_csv:
+            cmd_evaluate_vau_files(vs, _vau_parse_kv(a.vau_pred_csv, VAU_TASKS, "--vau_pred_csv"))
+        else:
+            cmd_evaluate_vau(cfg, vs, vau_resolve_backbones(bb, default_all=True))
+
+
+# -----------------------------------------------------------------------------
+# Self-test (no model downloads, no GPU, no network)
+# -----------------------------------------------------------------------------
+
+# Rows in the official schema. Abuse028 is verbatim from test_ucf_crime.csv except
+# the long text fields; the others reproduce the official edge cases: (0, 0)
+# normal videos, a (-1, -1) interval, a '-1' QA/CLS row and a malformed MSAD
+# Correct Option. 'world' is the simulated video content (class, interval),
+# which is what a perfect model would see; it differs from the GT exactly where
+# the official annotation is missing ((-1, -1) or '-1').
+_VAU_FIX: Dict[str, List[Dict[str, Any]]] = {
+    "msad": [
+        {"Video Name": "Assault_2.mp4", "Correct Option": "A", "Anomaly Class": "Assault",
+         "Start Time": 5.5, "End Time": 11.0, "_sec": 16.0, "_world": ("Assault", (5.5, 11.0))},
+        {"Video Name": "Normal_3.mp4", "Correct Option": "B", "Anomaly Class": "Normal",
+         "Start Time": 0.0, "End Time": 0.0, "_sec": 10.0, "_world": ("Normal", None)},
+        {"Video Name": "Fire_7.mp4", "Correct Option": "D. Green trash bin tipping over unexpectedly",
+         "Anomaly Class": "Fire", "Start Time": 2.0, "End Time": 6.5, "_sec": 10.0,
+         "_world": ("Fire", (2.0, 6.5))}],
+    "ucf": [
+        {"Video Name": "Abuse028_x264.mp4", "Correct Option": "A", "Anomaly Class": "Abuse",
+         "Start Time": 5.5, "End Time": 8.0, "_sec": 12.0, "_world": ("Abuse", (5.5, 8.0))},
+        {"Video Name": "Arson011_x264.mp4", "Correct Option": "B", "Anomaly Class": "Arson",
+         "Start Time": -1.0, "End Time": -1.0, "_sec": 10.0, "_world": ("Arson", (2.0, 6.0))},
+        {"Video Name": "Abuse030_x264.mp4", "Correct Option": "-1", "Anomaly Class": "-1",
+         "Start Time": 4.0, "End Time": 6.0, "_sec": 10.0, "_world": ("Abuse", (4.0, 6.0))},
+        {"Video Name": "Normal_Videos_003_x264.mp4", "Correct Option": "A", "Anomaly Class": "Normal",
+         "Start Time": 0.0, "End Time": 0.0, "_sec": 8.0, "_world": ("Normal", None)}],
+    "ecva": [
+        {"Video Name": "14.mp4", "Correct Option": "B", "Anomaly Class": "Traffic_accident",
+         "Start Time": 3.0, "End Time": 9.0, "_sec": 12.0, "_world": ("Traffic_accident", (3.0, 9.0))},
+        {"Video Name": "24.mp4", "Correct Option": "C", "Anomaly Class": "Medical Abnormality",
+         "Start Time": 1.0, "End Time": 4.0, "_sec": 8.0,
+         "_world": ("Medical Abnormality", (1.0, 4.0))}]}
+
+
+def _vau_fixture_row(subset: str, r: Dict[str, Any]) -> Dict[str, Any]:
+    m1 = r["Correct Option"] == "-1"
+    n = r["Video Name"]
+    return {"Video Name": n,
+            "Question": "-1" if m1 else f"What is the key event in {n}?",
+            **{f"Option {k}": ("-1" if m1 else f"option {k} of {n}") for k in range(1, 5)},
+            "Correct Option": r["Correct Option"], "Key Object": "-1" if m1 else "person",
+            "Description": "-1" if m1 else f"GT description of {n}.",
+            "Reasoning": "-1" if m1 else f"{{'Specific Anomaly Type': '{r['Anomaly Class']}'}}",
+            "Anomaly Class": r["Anomaly Class"], "Start Time": r["Start Time"],
+            "End Time": r["End Time"]}
+
+
+def _vau_build_fixture(root: str) -> None:
+    for k, (s, rows) in enumerate(_VAU_FIX.items()):
+        vau_write_csv(os.path.join(root, "annotations", VAU_TEST_FILES[s]), VAU_COLUMNS,
+                      [[_vau_fixture_row(s, r)[c] for c in VAU_COLUMNS] for r in rows])
+        for j, r in enumerate(rows):
+            sub = "Anomaly-Videos/Abuse" if s == "ucf" and j % 2 == 0 else ""
+            _write_video(os.path.join(root, "videos", s, sub, r["Video Name"]), r["_sec"],
+                         seed=31 + 7 * k + j)
+
+
+def _vau_mock_oracle(world: Dict[str, Tuple[str, Optional[Tuple[float, float]], str]],
+                     frame_t: Dict[Tuple[str, int], float], win_ids: Dict[str, Tuple[int, ...]],
+                     log: List[Tuple[str, str, str]]):
+    """A perfect world for the fixtures, keyed by the video's window directory:
+    (class, interval, QA letter). The method under test only sees log-probs."""
+    def visible(d: str, ids: Sequence[int]) -> bool:
+        c, iv, _ = world[d]
+        return iv is not None and any(iv[0] <= frame_t[(d, f)] < iv[1] for f in ids)
+
+    def where(img: str) -> Tuple[Optional[str], Sequence[int]]:
+        if img == "__content_free__" or os.path.basename(img) == "content_free.jpg":
+            return None, ()
+        ap = os.path.abspath(img)
+        d = os.path.dirname(ap)
+        m = _KEEP_RE.search(ap)
+        return d, (range(int(m.group(1)), int(m.group(2)) + 1) if m else win_ids[ap])
+
+    def oracle(kind, system, user, images, options):
+        log.append((kind, system, user))
+        if kind == "chat":
+            d = os.path.dirname(os.path.abspath(images[0]))
+            c = world[d][0]
+            return (f"The scene shows {vau_human(c)}." if user == VAU_DESCRIPTION_PROMPT
+                    else f"An anomaly of type {vau_human(c)} occurs." if c != "Normal"
+                    else "No anomaly occurs.")
+        require(kind == "score", f"unexpected call kind {kind}")
+        d, ids = where(images[0])
+        if system == P_VAU_ANOMALY_SYS:
+            if d is None:
+                lo = -1.0
+            elif user == vau_anomaly_user():
+                lo = 3.0 if visible(d, ids) else -3.0
+            else:
+                lo = 3.0 if visible(d, ids) and user == vau_class_user(world[d][0]) else -3.0
+            return {"yes": lo / 2, "no": -lo / 2}
+        letters = list(options)
+        if d is None:
+            return {L: 0.0 for L in letters}
+        if system == P_VAU_CLS_SYS:
+            tgt = VAU_LETTERS[VAU_CLASSES.index(world[d][0] if visible(d, ids) else "Normal")]
+        else:
+            require(system == P_VAU_QA_SYS, f"unexpected system prompt {system[:40]}")
+            c, iv, qa = world[d]
+            tgt = qa if (iv is None or visible(d, ids)) and qa else None
+        return {L: (0.0 if L == tgt else -6.0) for L in letters}
+    return oracle
+
+
+def _vau_judge_mock(system: str, prompt: str) -> str:
+    """Rates 10 on every axis iff the predicted description names the GT class
+    (read from the GT 'Analysis' = Reasoning field); the first reply to every
+    prompt is malformed so that the retry path is exercised."""
+    require(system == VAU_JUDGE_SYSTEM, "judge system message differs from the official one")
+    gt_ana = prompt.split("- Analysis: ", 1)[1].split("\n", 1)[0]
+    desc = prompt.split("Model Output:\n        - Description: ", 1)[1].split("\n", 1)[0]
+    _VAU_JUDGE_SEEN[prompt] = _VAU_JUDGE_SEEN.get(prompt, 0) + 1
+    if _VAU_JUDGE_SEEN[prompt] == 1:
+        return "Here is my evaluation: {classification_score: 10}"
+    m = re.search(r"Type': '([^']+)'", gt_ana)
+    ok = bool(m) and vau_human(m.group(1)) in desc
+    sc = {k: (10 if ok else 2) for k in VAU_EVAL_KEYS[:-1]}
+    sc["total_score"] = sum(sc.values())
+    return "```json\n" + json.dumps({**sc, "comments": {}}) + "\n```"
+
+
+_VAU_JUDGE_SEEN: Dict[str, int] = {}
+
+
+def _vau_official_prompt_parity(repo: str) -> Dict[str, bool]:
+    """Evaluate the official f-strings / constants with ast and compare them to
+    the prompts used here."""
+    import ast
+    ev = os.path.join(repo, "src", "evaluation")
+
+    def tree(name: str) -> "ast.Module":
+        with open(os.path.join(ev, name), encoding="utf-8") as fh:
+            return ast.parse(fh.read())
+
+    def const(t, name):
+        for n in ast.walk(t):
+            if isinstance(n, ast.Assign) and any(getattr(x, "id", "") == name for x in n.targets):
+                return n.value
+        raise RuntimeError(f"{name} not found")
+    out: Dict[str, bool] = {}
+    t = tree("evaluation_cls.py")
+    out["CLS FIXED_OPTION"] = tuple(ast.literal_eval(const(t, "FIXED_OPTION"))) == VAU_CLASSES
+    t = tree("inference_cls_qwen.py")
+    out["CLS FIXED_QUESTION"] = ast.literal_eval(const(t, "FIXED_QUESTION")) == VAU_CLS_QUESTION
+    out["CLS option list"] = ast.literal_eval(const(t, "FIXED_OPTION")) == str(list(VAU_CLASSES))
+    t = tree("inference_qa_qwen.py")
+    fn = next(n for n in ast.walk(t) if isinstance(n, ast.FunctionDef)
+              and n.name == "generate_prompt_w_o_think")
+    data = {"Question": "Q?", "Option 1": "o1", "Option 2": "o2", "Option 3": "o3", "Option 4": "o4"}
+    off = eval(compile(ast.Expression(fn.body[0].value), "qa", "eval"), {}, {"data": data})
+    out["QA prompt (no think)"] = off == vau_qa_user(VAUItem("x", "x.mp4", "Q?", ("o1", "o2", "o3", "o4")))
+    t = tree("inference_reasoning_qwen.py")
+    out["reasoning prompts"] = (ast.literal_eval(const(t, "description_prompt")) == VAU_DESCRIPTION_PROMPT
+                                and ast.literal_eval(const(t, "analysis_prompt")) == VAU_ANALYSIS_PROMPT)
+    t = tree("evaluate_reasoning_deepseek.py")
+    vals = {"gt_description": "GD", "gt_analysis": "GA", "description": "D", "analysis": "A"}
+    off = eval(compile(ast.Expression(const(t, "evaluation_prompt")), "j", "eval"), {}, vals)
+    out["VAU-Eval judge prompt"] = off == vau_judge_prompt("GD", "GA", "D", "A")
+    sysmsg = [n.value for n in ast.walk(t) if isinstance(n, ast.Constant)
+              and isinstance(n.value, str) and n.value.startswith("You are an expert evaluator")]
+    out["VAU-Eval judge system message"] = sysmsg == [VAU_JUDGE_SYSTEM]
+    out["VAU-Eval judge model deepseek-chat"] = any(isinstance(n, ast.Constant) and n.value ==
+                                                    "deepseek-chat" for n in ast.walk(t))
+    return out
+
+
+def selftest_vau(official_repo: str = "", official_python: str = "", verbose: bool = True) -> None:
+    import inspect as _inspect
+    import shutil
+    import tempfile
+    fails, n = [], [0]
+
+    def chk(name: str, cond: bool, detail: str = "") -> None:
+        n[0] += 1
+        if not cond:
+            fails.append(f"{name}: {detail}")
+        if verbose:
+            print(f"  [{'ok' if cond else 'FAIL'}] {name}" + (f" -- {detail}" if detail and not cond else ""))
+
+    def raises(name: str, fn: Callable, needle: str) -> None:
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001 - the message is what is tested
+            chk(name, needle.lower() in str(e).lower(), f"message lacks {needle!r}: {str(e)[:300]}")
+            return
+        chk(name, False, "no exception raised")
+
+    if not LOG.handlers:
+        logging.basicConfig(level=logging.WARNING)
+    _VAU_ECHO[0] = False
+    ap = build_parser()
+    print("== VAU-Bench: routing, backbones, guards ==")
+    raises("legacy command with --dataset vau_bench is refused",
+           lambda: _legacy_dataset_guard(ap.parse_args(["run", "--dataset", "vau_bench"])),
+           "VideoGlitchBench command")
+    raises("VAU command with --dataset ual_bench is refused",
+           lambda: main_vau(ap.parse_args(["run_vau", "--dataset", "ual_bench"])), "VAU-Bench command")
+    raises("vanilla / GliDe cannot be run on VAU-Bench",
+           lambda: main_vau(ap.parse_args(["run_vau", "--vau_dataset", "msad", "--method",
+                                           "vanilla"])), "GliDe")
+    a1 = ap.parse_args(["run_vau", "--vau_dataset", "all", "--vau_work_root", "/tmp/x"])
+    vs1 = vau_settings_from_args(a1)
+    chk("CLI defaults are the predeclared rule (fps 2, tau 0, lambda inf, frame, hypothesis, BMA "
+        "0.99/8, no option calibration, HOVER reasoning context)", vs1.predeclared(), str(vs1.rule()))
+    raises("--vau_tasks cannot drop TAG or CLS",
+           lambda: vau_settings_from_args(ap.parse_args(["run_vau", "--vau_dataset", "msad",
+                                                         "--vau_tasks", "qa"])), "always computed")
+    chk("VAU backbones are BACKBONES checkpoints", all(BACKBONES[k]["hf"] == v[1]
+                                                       for k, v in VAU_BACKBONES.items()))
+    raises("a non-listed backbone is refused", lambda: vau_resolve_backbones("internvl2.5-4b"),
+           "not part of the VAU-Bench experiment")
+    raises("--model substitution is refused",
+           lambda: vau_backbone_config(Config(), "qwen2.5-vl-7b", VAUSettings(),
+                                       "Qwen/Qwen2.5-VL-3B-Instruct"), "never substitutes")
+    chk("VideoGlitchBench Config is unchanged", Config().fps == 4.0 and VERSION == "10.0"
+        and Config().work_subdir == "HOVER_v8_work")
+
+    print("== VAU-Bench: official evaluator ports (hand cases) ==")
+    chk("parse_html: <glue>[0.0, 10.4]</glue>",
+        vau_parse_glue("<answer>Anomaly</answer><glue>[0.0, 10.4]</glue>") == (0.0, 10.4))
+    chk("parse_html: mm:ss times", vau_parse_glue("<glue>[01:05, 01:10.5]</glue>") == (65.0, 70.5))
+    chk("parse_html: bare [s, e] fallback", vau_parse_glue("from [1.5, 2]") == (1.5, 2.0))
+    chk("parse_html: nothing -> (0, 0)", vau_parse_glue("Normal") == (0.0, 0.0))
+    chk("parse_html: three numbers -> (0, 0)", vau_parse_glue("<glue>[1, 2, 3]</glue>") == (0.0, 0.0))
+    gtt = {n_: VAUGroundTruth(n_, "A", "Fire", s_, e_, "d", "r", "k") for n_, s_, e_ in
+           (("a.mp4", 2.0, 4.0), ("b.mp4", 0.0, 0.0), ("c.mp4", -1.0, -1.0), ("d.mp4", 1.0, 3.0))}
+    tg = vau_official_tag(gtt, [("a", "<glue>[3, 5]</glue>"), ("b.mp4", "<glue>[0, 9]</glue>"),
+                                ("c.mp4", "<glue>[1, 2]</glue>"), ("d.mp4", "<glue>[2, 2]</glue>"),
+                                ("a.mp4", "<glue>[2, 4]</glue>")])
+    chk("TAG: '.mp4' appended (then 'a' and 'a.mp4' both score the FIRST row, as pandas "
+        ".values[0]), (0, 0) skipped, (-1, -1) scored 0, pred_start == pred_end -> 0, "
+        "mIoU = round(mean, 4) * 100",
+        tg["n"] == 4 and tg["miou"] == round((2 / 3) / 4, 4) * 100
+        and tg["r@0.3"] == round(2 / 4, 4) * 100 and tg["r@0.5"] == 0.0, str(tg))
+    tv = vau_official_tag(gtt, [("a.mp4", "<glue>[3, 5]</glue>"), ("c.mp4", "<glue>[1, 2]</glue>")],
+                          valid_only=True)
+    chk("TAG valid-GT variant drops (-1, -1)", tv["n"] == 1 and tv["miou"] == round(1 / 3, 4) * 100)
+    raises("TAG with no scorable video fails like the official script",
+           lambda: vau_official_tag(gtt, [("b.mp4", "[1, 2]")]), "divides")
+    gq = [VAUGroundTruth("a.mp4", "a", "Fire", 0, 0, "", "", ""),
+          VAUGroundTruth("b.mp4", "D. text", "Fire", 0, 0, "", "", ""),
+          VAUGroundTruth("c.mp4", "B", "Fire", 0, 0, "", "", "")]
+    q1 = vau_official_qa(gq, {"a.mp4": "A", "b.mp4": "D", "c.mp4": "NA"})
+    chk("QA: case-insensitive, NaN ('NA' cell) leaves the denominator, malformed key never matches",
+        q1["n_valid"] == 2 and q1["accuracy"] == 50.0, str(q1))
+    chk("CLS extract: <answer> text, spaces/underscores, case", vau_extract_options(
+        "<think>Fire?</think><answer>traffic  accident</answer>") == ["Traffic_accident"])
+    chk("CLS extract: order of appearance, no <answer>",
+        vau_extract_options("Robbery, then Fighting") == ["Robbery", "Fighting"])
+    chk("CLS extract: every class round-trips through <answer>",
+        all(vau_extract_options(f"<answer>{c}</answer>") == [c] for c in VAU_CLASSES))
+    gc = [VAUGroundTruth("a.mp4", "A", "Normal", 0, 0, "", "", ""),
+          VAUGroundTruth("b.mp4", "A", "-1", 0, 0, "", "", ""),
+          VAUGroundTruth("c.mp4", "A", "Fire", 0, 0, "", "", ""),
+          VAUGroundTruth("d.mp4", "A", "Fire", 0, 0, "", "", "")]
+    cl = vau_official_cls(gc, [("a.mp4", "<answer>Normal</answer>"), ("b.mp4", "<answer>Fire</answer>"),
+                               ("c.mp4", "<answer>Explosion</answer>")])
+    chk("CLS: binary/20-way rule, '-1' GT, missing prediction counted wrong",
+        cl["binary_accuracy"] == 75.0 and cl["cls_accuracy"] == 25.0 and cl["n_valid"] == 3, str(cl))
+    good = "```json\n" + json.dumps({k: 7 for k in VAU_EVAL_KEYS}) + "\n```"
+    chk("VAU-Eval parse: fenced JSON", vau_parse_judge(good) == {k: 7 for k in VAU_EVAL_KEYS})
+    chk("VAU-Eval parse: unfenced / invalid / non-numeric -> None",
+        vau_parse_judge('{"total_score": 3}') is None and vau_parse_judge("```json\n{x}\n```") is None
+        and vau_parse_judge('```json\n{"total_score": "3"}\n```') is None)
+    rr = vau_official_reasoning(
+        {"a.mp4": VAUGroundTruth("a.mp4", "A", "Fire", 0, 0, "gd", "ga", ""),
+         "b.mp4": VAUGroundTruth("b.mp4", "A", "Fire", 0, 0, "gd", "ga", "")},
+        [("a.mp4", "d", "a"), ("b.mp4", "", "a")], {"a.mp4": {"total_score": 40}})
+    chk("VAU-Eval: mean over judged rows, empty text skipped, missing key = 0",
+        rr["n_judged"] == 1 and rr["n_skipped_incomplete"] == 1 and rr["total_score"] == 40.0
+        and rr["fluency_score"] == 0.0, str(rr))
+
+    print("== VAU-Bench: HOVER-VAU components ==")
+    sel, w, mass = vau_occam_window([0.0, 0.0, 0.0, 0.0], 0.99, 8)
+    chk("Occam window: uniform posterior keeps every window (mass 1)", sel == [0, 1, 2, 3] and
+        abs(mass - 1.0) < 1e-12 and abs(float(w.sum()) - 1.0) < 1e-12)
+    sel, w, mass = vau_occam_window([0.0, 12.0, 0.5, -3.0], 0.99, 8)
+    chk("Occam window: a dominant window is kept alone (mass >= 0.99)", sel == [1] and mass >= 0.99)
+    sel, w, mass = vau_occam_window(list(np.linspace(0, 0.01, 40)), 0.99, 8)
+    chk("Occam window: the cap is applied and the kept mass reported", len(sel) == 8 and mass < 0.5)
+    p = vau_location_posterior([math.log(3.0), 0.0])
+    chk("location posterior = normalised likelihood ratios", abs(p[0] - 0.75) < 1e-12)
+    chk("letter options match case-sensitively ('a', 'I' are words)",
+        vau_match_letter_logprobs([{"token": "a", "logprob": -0.1}, {"token": " B", "logprob": -2.0}],
+                                  {"A": ["A"], "B": ["B"]})[0]["B"] == -2.0
+        and vau_match_letter_logprobs([{"token": "a", "logprob": -0.1}, {"token": " B", "logprob": -2.0}],
+                                      {"A": ["A"], "B": ["B"]})[1])
+    chk("prompts carry no GT: QA prompt = official template with question/options only",
+        "Correct" not in _VAU_QA_TEMPLATE and "{" not in vau_qa_user(VAUItem("x", "x.mp4", "q", ("1", "2", "3", "4"))))
+    sig = set(_inspect.signature(vau_infer_video).parameters)
+    chk("inference receives no ground truth (VAUItem has only model-visible fields)",
+        set(VAUItem.__dataclass_fields__) == {"subset", "video_name", "question", "options"}
+        and "gt" not in sig and "ds" not in sig, str(sig))
+
+    if cv2 is None:
+        print("== VAU-Bench end-to-end: SKIPPED (opencv missing) ==")
+    else:
+        print("== VAU-Bench: official-schema fixtures, isolation, end-to-end HOVER-VAU ==")
+        tmp = tempfile.mkdtemp(prefix="vau_selftest_")
+        root = os.path.join(tmp, "VAU-R1")
+        _vau_build_fixture(root)
+        vgb = os.path.join(tmp, "VideoGlitchBench")
+        atomic_write_json(os.path.join(vgb, "annotations.json"), [{"video_name": "x.mp4"}])
+        atomic_write_json(os.path.join(vgb, "HOVER_v8_work", "cache", "qwen2.5-vl-7b", "ab",
+                                       "abc.json"), {"v": 1})
+        work = os.path.join(tmp, "HOVER_v10_vau_work")
+        base = Config(root=vgb, backend="mock", n_bootstrap=300, n_permutations=500, fps=2.0)
+
+        def mk(**kw) -> VAUSettings:
+            d = dict(subsets=VAU_SUBSETS, annotations_dir=os.path.join(root, "annotations"),
+                     video_root=os.path.join(root, "videos"), work_root=work)
+            d.update(kw)
+            return VAUSettings(**d)
+        raises("missing annotation source is an actionable error, never a fallback",
+               lambda: vau_load_dataset(VAUSettings(subsets=("msad",)), "msad"),
+               "--vau_annotations_dir")
+        raises("a file of another benchmark is refused by schema",
+               lambda: vau_parse_rows("msad", [{"video_id": "x"}], "f.csv"), "not a VAU-Bench")
+        raises("VAU work root inside the VideoGlitchBench root is refused",
+               lambda: vau_resolve_work_root(mk(work_root=os.path.join(vgb, "w")), base),
+               "VideoGlitchBench root")
+        raises("VAU work root inside the annotations is refused",
+               lambda: vau_resolve_work_root(mk(work_root=os.path.join(root, "annotations", "w")), base),
+               "annotation directory")
+        chk("default VAU work root is a sibling of the annotations directory",
+            vau_resolve_work_root(mk(work_root=""), base) == os.path.join(root, "HOVER_v10_vau_work"))
+        dss = {s: vau_load_dataset(mk(), s) for s in VAU_SUBSETS}
+        chk("every fixture video resolves (recursive index, UCF class sub-folders)",
+            all(all(v for v in d.video_paths.values()) for d in dss.values()))
+        au = vau_annotation_audit(dss["ucf"])
+        chk("audit: UCF (-1, -1) rows and '-1' QA rows are counted",
+            au["tag_rows_without_valid_interval_scored_as_iou0"] == 1 and au["qa_unanswerable_-1"] == 1
+            and au["tag_skipped_normal_(0,0)"] == 1, str(au))
+        chk("audit: malformed MSAD Correct Option is reported",
+            vau_annotation_audit(dss["msad"])["qa_correct_option_malformed"] == [
+                "D. Green trash bin tipping over unexpectedly"])
+        chk("cache namespace is GT-free", vau_cache_namespace(base, dss["msad"]) == vau_cache_namespace(
+            base, VAUDataset(**{**dss["msad"].__dict__, "annotation_sha256": "other"})))
+        k1 = make_vau_vlm(base, os.path.join(tmp, "k1"), vau_cache_namespace(base, dss["msad"]),
+                          lambda *a_: {})
+        k2 = make_vau_vlm(base, os.path.join(tmp, "k2"), vau_cache_namespace(base, dss["ucf"]),
+                          lambda *a_: {})
+        u1 = make_ual_vlm(base, os.path.join(tmp, "k3"), {"dataset": "ual_bench/uag_oops"},
+                          lambda *a_: {})
+        kargs = ("score", P_VAU_ANOMALY_SYS, "u", [], {})
+        chk("VAU cache keys cannot collide with VideoGlitchBench, UAL-Bench or across test sets",
+            len({MockVLM(base, os.path.join(tmp, "k4"), lambda *a_: {})._key(*kargs),
+                 k1._key(*kargs), k2._key(*kargs), u1._key(*kargs)}) == 4)
+        # simulated world, keyed by window directory
+        world: Dict[str, Tuple[str, Optional[Tuple[float, float]], str]] = {}
+        frame_t: Dict[Tuple[str, int], float] = {}
+        win_ids: Dict[str, Tuple[int, ...]] = {}
+        memo: Dict = {}
+        cfgp = vau_backbone_config(base, "qwen2.5-vl-7b", mk())
+        for s, d in dss.items():
+            for r in _VAU_FIX[s]:
+                wins, _ = vau_prepare_video(cfgp, mk(), d, r["Video Name"], memo)
+                wd = os.path.dirname(os.path.abspath(wins[0].stitch_path))
+                co = r["Correct Option"]
+                world[wd] = (r["_world"][0], r["_world"][1], "" if co == "-1" else co[0])
+                for w_ in wins:
+                    win_ids[os.path.abspath(w_.stitch_path)] = tuple(w_.frame_ids)
+                    for fid, ft in zip(w_.frame_ids, w_.frame_times):
+                        frame_t[(wd, fid)] = ft
+        chk("VAU windows are written under <work>/vau_bench/<test set>/windows",
+            all(os.path.abspath(v[0][0].stitch_path).startswith(os.path.join(work, "vau_bench"))
+                for v in memo.values() if not isinstance(v, Exception)))
+        prompts: List[Tuple[str, str, str]] = []
+        oracle = _vau_mock_oracle(world, frame_t, win_ids, prompts)
+        snap_vgb, snap_root = _ual_snapshot(vgb), _ual_snapshot(root)
+        g_ = globals()
+        saved = (g_["load_records"], g_["load_splits"])
+
+        def _boom(*_a, **_k):
+            raise AssertionError("VideoGlitchBench loader called from a VAU command")
+        g_["load_records"] = g_["load_splits"] = _boom
+        _VAU_JUDGE_SEEN.clear()
+        try:
+            md = cmd_run_vau(base, mk(judge=True, judge_backend="mock", official_repo=official_repo,
+                                      official_python=official_python),
+                             ["qwen2.5-vl-7b", "ui-tars-1.5-7b"], oracle=oracle,
+                             judge_fn=_vau_judge_mock)
+            routed = True
+        except AssertionError as e:
+            routed, md = False, ""
+            chk("VAU run never calls the VideoGlitchBench loaders", False, str(e))
+        finally:
+            g_["load_records"], g_["load_splits"] = saved
+        if routed:
+            chk("VAU run never calls the VideoGlitchBench loaders", True)
+            chk("VideoGlitchBench tree is byte-for-byte untouched", _ual_snapshot(vgb) == snap_vgb)
+            chk("VAU-Bench data tree is untouched", _ual_snapshot(root) == snap_root)
+            new = set(_ual_snapshot(tmp)) - set(snap_vgb) - set(snap_root)
+            chk("every file the VAU run wrote is inside the VAU work root",
+                all(_ual_within(p, work) or p.startswith(os.path.join(tmp, "k")) for p in new),
+                str(sorted(p for p in new if not _ual_within(p, work))[:3]))
+            chk("prompts: only the VAU system prompts and the official reasoning turns",
+                {p[1] for p in prompts if p[0] == "score"} <= {P_VAU_ANOMALY_SYS, P_VAU_CLS_SYS,
+                                                                P_VAU_QA_SYS}
+                and {p[2] for p in prompts if p[0] == "chat"} == {VAU_DESCRIPTION_PROMPT,
+                                                                   VAU_ANALYSIS_PROMPT})
+            gt_txt = {r["Correct Option"] for rows in _VAU_FIX.values() for r in rows
+                      if len(r["Correct Option"]) > 2} | {
+                _vau_fixture_row(s, r)["Description"] for s, rows in _VAU_FIX.items() for r in rows
+                if r["Correct Option"] != "-1"}
+            chk("no GT text (answer key, description) appears in any prompt",
+                not any(t in p[1] or t in p[2] for p in prompts for t in gt_txt))
+            met = {s: read_json(os.path.join(vau_paths(mk(), s, "qwen2.5-vl-7b")["run"],
+                                              "metrics.json")) for s in VAU_SUBSETS}
+            raw = {s: {r["video_name"]: r for r in read_json(os.path.join(
+                vau_paths(mk(), s, "qwen2.5-vl-7b")["run"], "raw_outputs.json"))["items"]}
+                for s in VAU_SUBSETS}
+            exact = all(abs(raw[s][r["Video Name"]]["pred_start"] - r["_world"][1][0]) < 1e-6
+                        and abs(raw[s][r["Video Name"]]["pred_end"] - r["_world"][1][1]) < 1e-6
+                        for s, rows in _VAU_FIX.items() for r in rows if r["_world"][1])
+            chk("TAG recovers every simulated anomaly interval at frame resolution (0.5 s)", exact,
+                str({n_: (r["pred_start"], r["pred_end"]) for s in raw for n_, r in raw[s].items()}))
+            chk("H: the class posterior picks the simulated class; Normal for normal videos",
+                all(raw[s][r["Video Name"]]["cls_pred"] == r["_world"][0]
+                    for s, rows in _VAU_FIX.items() for r in rows))
+            chk("V: anomalous videos use the class-conditioned profile, normal ones the generic one",
+                all(raw[s][r["Video Name"]]["tag_profile_source"] ==
+                    ("generic" if r["_world"][0] == "Normal" else "hypothesis")
+                    for s, rows in _VAU_FIX.items() for r in rows))
+            om = {s: met[s]["official_metrics"] for s in VAU_SUBSETS}
+            chk("UCF TAG (official script): the (-1, -1) row scores 0 -> mIoU 66.67; valid GT: 100",
+                abs(om["ucf"]["tag"]["miou"] - round(2 / 3, 4) * 100) < 1e-9 and om["ucf"]["tag"]["n"] == 3
+                and om["ucf"]["tag_valid_gt"]["miou"] == 100.0 and om["ucf"]["tag_valid_gt"]["n"] == 2,
+                str(om["ucf"]))
+            chk("UCF QA: the '-1' row is answered and scored wrong (75%); audited 100%",
+                om["ucf"]["qa"]["accuracy"] == 75.0 and om["ucf"]["qa"]["n_valid"] == 4
+                and met["ucf"]["diagnostics_not_official"]["qa_audited_accuracy"] == 100.0)
+            chk("MSAD QA: the malformed Correct Option can never match (66.67%)",
+                abs(om["msad"]["qa"]["accuracy"] - 200 / 3) < 1e-9)
+            chk("UCF CLS: '-1' GT row is wrong in 20-way, right in binary (75 / 100)",
+                om["ucf"]["cls"]["cls_accuracy"] == 75.0 and om["ucf"]["cls"]["binary_accuracy"] == 100.0)
+            chk("ECVA: perfect world gives 100 on every official metric",
+                om["ecva"]["qa"]["accuracy"] == 100.0 and om["ecva"]["tag"]["miou"] == 100.0
+                and om["ecva"]["cls"]["cls_accuracy"] == 100.0, str(om["ecva"]))
+            chk("VAU-Eval: malformed judge replies are retried; descriptions naming the class get 50",
+                om["ecva"]["reason"]["total_score"] == 50.0 and om["ecva"]["reason"]["n_judged"] == 2
+                and met["ecva"]["diagnostics_not_official"]["judge"]["retries_used"] >= 2,
+                str(om["ecva"].get("reason")))
+            csvs = met["msad"]["prediction_csvs"]
+            chk("official prediction CSVs with the official headers",
+                all(tuple(vau_read_csv(p)[0].keys()) == VAU_PRED_HEADERS[t] for t, p in csvs.items()))
+            chk("raw outputs are GT-free", not any(k in r for s in raw for r in raw[s].values()
+                                                   for k in ("Correct Option", "Start Time",
+                                                             "correct_option", "anomaly_class")))
+            man = read_json(os.path.join(vau_paths(mk(), "msad", "qwen2.5-vl-7b")["run"],
+                                         "manifest.json"))
+            chk("manifest records model, prompts, rule and data fingerprints",
+                man["model"] == "Qwen/Qwen2.5-VL-7B-Instruct" and man["predeclared"]
+                and man["annotation_sha256"] == dss["msad"].annotation_sha256 and man["fps"] == 2.0)
+            with open(md, encoding="utf-8") as fh:
+                mdl = fh.read().splitlines()
+            chk("summary: main header and one row per backbone per test set",
+                VAU_MAIN_HEADER in mdl
+                and sum(1 for l_ in mdl if l_.startswith("Qwen2.5-VL-7B-Instruct | ")) >= 9
+                and sum(1 for l_ in mdl if l_.startswith("Trivial references | ")) == 3)
+            if official_repo:
+                chk("port == unmodified official scripts on every fixture run",
+                    all(met[s]["official_script_parity"][t]["identical"]
+                        for s in VAU_SUBSETS for t in ("qa", "tag", "cls")))
+            # partial run labelling
+            md_p = cmd_run_vau(base, mk(subsets=("ucf",), limit=2, tasks=("tag", "cls")),
+                               ["qwen2.5-vl-7b"], oracle=oracle)
+            rp = os.path.join(vau_paths(mk(limit=2), "ucf", "qwen2.5-vl-7b")["run"], "raw_outputs.json")
+            with open(md_p, encoding="utf-8") as fh:
+                txt_p = fh.read()
+            chk("--limit marks a partial run in paths, outputs and the summary; the partial run is "
+                "scored on its own videos", os.path.exists(rp) and read_json(rp)["partial"]
+                and "partial_limit2" in rp and "PARTIAL RUN" in txt_p
+                and read_json(os.path.join(os.path.dirname(rp), "metrics.json"))[
+                    "official_metrics"]["cls"]["n_total"] == 2)
+            # a non-predeclared rule goes to its own directory
+            alt = mk(subsets=("ecva",), tag_profile="generic", tasks=("tag", "cls"))
+            cmd_run_vau(base, alt, ["qwen2.5-vl-7b"], oracle=oracle)
+            chk("ablation (generic TAG profile) writes to its own rule directory",
+                alt.rule_tag.startswith("rule_") and os.path.exists(os.path.join(
+                    vau_paths(alt, "ecva", "qwen2.5-vl-7b")["run"], "raw_outputs.json")))
+            # missing media
+            vf = dss["ecva"].video_paths["24.mp4"]
+            shutil.move(vf, vf + ".away")
+            try:
+                raises("a missing video aborts before inference with a remedy",
+                       lambda: cmd_run_vau(base, mk(subsets=("ecva",)), ["qwen2.5-vl-7b"],
+                                           oracle=oracle), "--vau_allow_missing_videos")
+                vm = mk(subsets=("ecva",), allow_missing_videos=True, tasks=("qa", "tag", "cls"))
+                cmd_run_vau(base, vm, ["qwen2.5-vl-7b"], oracle=oracle)
+                pm = read_json(os.path.join(vau_paths(vm, "ecva", "qwen2.5-vl-7b")["run"],
+                                            "metrics.json"))["official_metrics"]
+                chk("a missing video is a wrong answer, never an abstention (QA 1/2, TAG n = 2)",
+                    pm["qa"]["accuracy"] == 50.0 and pm["qa"]["n_valid"] == 2
+                    and pm["tag"]["n"] == 2 and pm["cls"]["cls_accuracy"] == 50.0, str(pm))
+            finally:
+                shutil.move(vf + ".away", vf)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    if official_repo:
+        print("== VAU-Bench: parity with the official VAU-R1 scripts ==")
+        for k, v in _vau_official_prompt_parity(official_repo).items():
+            chk(f"verbatim: {k}", v)
+        td = tempfile.mkdtemp(prefix="vau_parity_")
+        rng = np.random.default_rng(5)
+        rows_gt = []
+        for i in range(300):
+            nm = f"v{i}.mp4"
+            u = rng.random()
+            s_, e_ = ((0.0, 0.0) if u < 0.2 else (-1.0, -1.0) if u < 0.3 else
+                      (round(float(rng.uniform(0, 60)), 2), 0.0))
+            if e_ == 0.0 and s_ > 0:
+                e_ = round(s_ + float(rng.uniform(0.5, 30)), 2)
+            co = rng.choice(["A", "B", "C", "D", "-1", "D. some text"], p=[.4, .2, .15, .15, .05, .05])
+            ac = str(rng.choice(list(VAU_CLASSES) + ["-1"]))
+            r = {c: f"x{i}" for c in VAU_COLUMNS}
+            r.update({"Video Name": nm, "Correct Option": str(co), "Anomaly Class": ac,
+                      "Start Time": s_, "End Time": e_})
+            rows_gt.append(r)
+        ds_r = VAUDataset("msad", "", "", "", [], {}, {}, {}, [], "local")
+        _, ds_r.gt, ds_r.raw_rows = vau_parse_rows("msad", rows_gt, "random")
+        names = [r["Video Name"] for r in rows_gt]
+        fmt = [lambda a_, b_: f"<answer>Anomaly</answer><glue>[{a_:.2f}, {b_:.2f}]</glue>",
+               lambda a_, b_: f"The anomaly happens [{a_:.1f}, {b_:.1f}].",
+               lambda a_, b_: f"<glue>[{int(a_ // 60):02d}:{a_ % 60:05.2f}, "
+                              f"{int(b_ // 60):02d}:{b_ % 60:05.2f}]</glue>",
+               lambda a_, b_: "Normal <glue>[-1.0, -1.0]</glue>", lambda a_, b_: "no anomaly"]
+        preds = {"qa": [], "tag": [], "cls": []}
+        for i, nm in enumerate(names):
+            if i % 23 == 5:
+                continue                              # missing prediction rows
+            a_ = round(float(rng.uniform(0, 60)), 2)
+            b_ = round(a_ + float(rng.uniform(0, 20)), 2)
+            preds["tag"].append([nm if i % 7 else nm[:-4], fmt[i % 5](a_, b_)])
+            preds["qa"].append([nm, str(rng.choice(["A", "b", "C", "D", "", "D. some text"]))])
+            c1, c2 = rng.choice(list(VAU_CLASSES), 2)
+            preds["cls"].append([nm, rng.choice([f"<answer>{c1}</answer>", f"{c1} or {c2}",
+                                                 f"<think>{c2}</think><answer>{str(c1).replace('_', ' ').lower()}</answer>",
+                                                 "nothing"])])
+        vsr = VAUSettings(subsets=("msad",), work_root=td, official_repo=official_repo,
+                          official_python=official_python)
+        ev = vau_evaluate_predictions(ds_r, names, preds, os.path.join(td, "e"), vsr, None)
+        chk("port == official scripts on 300 random rows (mm:ss, bare brackets, missing rows, "
+            "'-1' rows, NaN answers, free-text classes)", ev["official_script_parity"] is not None
+            and all(v["identical"] for v in ev["official_script_parity"].values()),
+            str(ev["official_script_parity"]))
+        shutil.rmtree(td, ignore_errors=True)
+    else:
+        print("== VAU-Bench parity with the official VAU-R1 scripts: SKIPPED (pass --vau_repo) ==")
+
+    _VAU_ECHO[0] = True
+    print(f"\n{n[0] - len(fails)}/{n[0]} VAU-Bench checks passed")
+    if fails:
+        for f_ in fails:
+            print("  FAIL:", f_)
+        raise SystemExit(1)
+
+
+# =============================================================================
 # CLI
 # =============================================================================
 
 COMMANDS = ("selftest", "prepare", "diagnose", "probe", "calibrate", "run", "import_glide",
-            "export", "evaluate", "ablate") + UAL_COMMANDS
+            "export", "evaluate", "ablate") + UAL_COMMANDS + VAU_COMMANDS
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -5434,7 +8080,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--limit", type=int, default=None)
     # Dataset selector. None means VideoGlitchBench for the legacy commands and
     # UAL-Bench for the *_ual commands; any other combination is refused.
-    ap.add_argument("--dataset", default=None, choices=("videoglitchbench", "ual_bench"))
+    ap.add_argument("--dataset", default=None, choices=("videoglitchbench", "ual_bench", "vau_bench"))
     g = ap.add_argument_group("UAL-Bench (inspect_ual, run_ual, evaluate_ual, selftest_ual)")
     g.add_argument("--ual_dataset", default=None, choices=UAL_SUBSETS + ("all",))
     g.add_argument("--ual_root", default=None,
@@ -5460,6 +8106,55 @@ def build_parser() -> argparse.ArgumentParser:
                    help="evaluate_ual: score any file in the official prediction schema")
     g.add_argument("--ual_repo", default=None,
                    help="official UAL_Bench clone: cross-check against its evaluator script")
+    v = ap.add_argument_group("VAU-Bench (inspect_vau, run_vau, evaluate_vau, selftest_vau)")
+    v.add_argument("--vau_dataset", default=None, choices=VAU_SUBSETS + ("all",))
+    v.add_argument("--vau_source", default="local", choices=("local", "hf"),
+                   help="local: official CSVs (--vau_annotations_dir); hf: the gated Hugging Face "
+                        f"dataset {VAU_HF_REPO} (run `huggingface-cli login` first)")
+    v.add_argument("--vau_annotations_dir", default=None,
+                   help="annotations/ folder of https://github.com/GVCLab/VAU-R1 (test_*.csv)")
+    v.add_argument("--vau_hf_repo", default=VAU_HF_REPO)
+    v.add_argument("--vau_hf_revision", default=None)
+    v.add_argument("--vau_video_root", default=None,
+                   help="folder with msad/, ucf_crime/ (class sub-folders allowed) and ecva/")
+    for s_ in VAU_SUBSETS:
+        v.add_argument(f"--vau_{s_}_annotations", default=None)
+        v.add_argument(f"--vau_{s_}_videos", default=None)
+    v.add_argument("--vau_work_root", default=None,
+                   help="default: <parent of --vau_annotations_dir>/HOVER_v10_vau_work")
+    v.add_argument("--vau_tasks", default=",".join(VAU_TASKS),
+                   help="comma list; tag and cls are always computed (H feeds V)")
+    v.add_argument("--vau_seg_tau", type=float, default=VAU_PREDECLARED["seg_tau"])
+    v.add_argument("--vau_seg_penalty", type=float, default=VAU_PREDECLARED["seg_penalty"])
+    v.add_argument("--vau_refine_mode", default=VAU_PREDECLARED["refine_mode"], choices=UAL_REFINE_MODES)
+    v.add_argument("--vau_tag_profile", default=VAU_PREDECLARED["tag_profile"], choices=VAU_TAG_PROFILES)
+    v.add_argument("--vau_bma_mass", type=float, default=VAU_PREDECLARED["bma_mass"])
+    v.add_argument("--vau_bma_max_windows", type=int, default=VAU_PREDECLARED["bma_max_windows"])
+    v.add_argument("--vau_option_calibration", default=VAU_PREDECLARED["option_calibration"],
+                   action=argparse.BooleanOptionalAction)
+    v.add_argument("--vau_reason_context", default=VAU_PREDECLARED["reason_context"],
+                   choices=VAU_REASON_CONTEXTS)
+    v.add_argument("--vau_storyboard_frames", type=int, default=VAU_PREDECLARED["storyboard_frames"])
+    v.add_argument("--vau_storyboard_context", type=float,
+                   default=VAU_PREDECLARED["storyboard_context"])
+    v.add_argument("--vau_allow_missing_videos", action="store_true")
+    v.add_argument("--vau_api_bases", default="",
+                   help="backbone=url,... (one OpenAI-compatible server per backbone)")
+    v.add_argument("--vau_repo", default=None,
+                   help="official VAU-R1 clone: cross-check every metric against its scripts")
+    v.add_argument("--vau_repo_python", default=None,
+                   help="interpreter for the official scripts; needs pandas < 3 (default: this one)")
+    v.add_argument("--vau_judge", action="store_true",
+                   help="run VAU-Eval (official judge deepseek-chat; needs an API key)")
+    v.add_argument("--vau_judge_backend", default="openai", choices=("openai", "mock"))
+    v.add_argument("--vau_judge_api_base", default="https://api.deepseek.com")
+    v.add_argument("--vau_judge_model", default="deepseek-chat")
+    v.add_argument("--vau_judge_api_key", default=None, help="default: $DEEPSEEK_API_KEY")
+    v.add_argument("--vau_judge_temperature", type=float, default=None,
+                   help="default: not sent (provider default, as in the official script)")
+    v.add_argument("--vau_judge_retries", type=int, default=2)
+    v.add_argument("--vau_pred_csv", default=None,
+                   help="evaluate_vau: score official-format CSVs, e.g. qa=a.csv,tag=b.csv,cls=c.csv")
     return ap
 
 
@@ -5478,6 +8173,9 @@ def main() -> None:
     a = build_parser().parse_args()
     if a.command in UAL_COMMANDS:
         main_ual(a)     # own logging, paths and caches; never touches VideoGlitchBench
+        return
+    if a.command in VAU_COMMANDS:
+        main_vau(a)     # own logging, paths and caches; never touches VideoGlitchBench / UAL
         return
     _legacy_dataset_guard(a)
     if a.command == "selftest":
